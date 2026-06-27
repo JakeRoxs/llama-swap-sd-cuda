@@ -1,0 +1,89 @@
+FROM node:24-bookworm AS llama-swap-ui-build
+
+ARG LLAMA_SWAP_REPO=https://github.com/mostlygeek/llama-swap.git
+ARG LLAMA_SWAP_COMMIT=63bc2663951241cf1fd19e8253b498a79e11a76a
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      ca-certificates \
+      git \
+ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+
+RUN git clone --filter=blob:none "${LLAMA_SWAP_REPO}" llama-swap \
+ && git -C llama-swap checkout "${LLAMA_SWAP_COMMIT}"
+
+WORKDIR /src/llama-swap/ui-svelte
+
+RUN npm ci \
+ && npm run build
+
+
+FROM golang:1.26.1-bookworm AS llama-swap-build
+
+ARG LLAMA_SWAP_REPO=https://github.com/mostlygeek/llama-swap.git
+ARG LLAMA_SWAP_COMMIT=63bc2663951241cf1fd19e8253b498a79e11a76a
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      ca-certificates \
+      git \
+ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+
+RUN git clone --filter=blob:none "${LLAMA_SWAP_REPO}" llama-swap \
+ && git -C llama-swap checkout "${LLAMA_SWAP_COMMIT}"
+
+COPY docker/llama-swappo/ollama-api.patch /tmp/ollama-api.patch
+
+RUN git -C llama-swap apply /tmp/ollama-api.patch
+
+COPY --from=llama-swap-ui-build /src/llama-swap/proxy/ui_dist /src/llama-swap/proxy/ui_dist
+
+WORKDIR /src/llama-swap
+
+RUN GIT_HASH="$(git rev-parse --short HEAD)-swappo" \
+ && BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+ && GOOS=linux GOARCH=amd64 go build \
+      -ldflags="-X main.commit=${GIT_HASH} -X main.version=local_${GIT_HASH} -X main.date=${BUILD_DATE}" \
+      -o /out/llama-swap
+
+
+FROM nvidia/cuda:12.6.3-devel-ubuntu24.04 AS sd-build
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      ca-certificates \
+      git \
+      cmake \
+      build-essential \
+      pkg-config \
+ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /tmp/build
+
+RUN git clone --recursive https://github.com/leejet/stable-diffusion.cpp.git
+
+RUN cmake -S stable-diffusion.cpp -B stable-diffusion.cpp/build \
+      -DSD_CUDA=ON \
+      -DCMAKE_CUDA_ARCHITECTURES=86 \
+      -DCMAKE_BUILD_TYPE=Release
+
+RUN cmake --build stable-diffusion.cpp/build --config Release -j"$(nproc)"
+
+
+FROM ghcr.io/mostlygeek/llama-swap:unified-cuda
+
+USER root
+
+COPY --from=llama-swap-build /out/llama-swap /usr/local/bin/llama-swap
+COPY --from=sd-build /tmp/build/stable-diffusion.cpp/build/bin/sd-server /usr/local/bin/sd-server
+COPY --from=sd-build /tmp/build/stable-diffusion.cpp/build/bin/sd-cli /usr/local/bin/sd-cli
+
+RUN chmod 0755 /usr/local/bin/llama-swap /usr/local/bin/sd-server /usr/local/bin/sd-cli
+
+WORKDIR /app
