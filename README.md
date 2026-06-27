@@ -53,7 +53,7 @@ docker build -f Dockerfile.llama-swappo -t llama-swappo-sd-cuda:local .
 
 ## Optional Variant Maintenance
 
-The optional `llama-swappo-sd-cuda` image keeps the core Dockerfile independent from the Ollama-compatible changes. It builds a replacement `llama-swap` binary from a pinned upstream `llama-swap` commit plus the local patch at:
+The optional `llama-swappo-sd-cuda` image keeps the core Dockerfile independent from the Ollama-compatible changes. It builds a replacement `llama-swap` binary from the latest upstream `llama-swap` source plus the local patch at:
 
 ```text
 docker/llama-swappo/ollama-api.patch

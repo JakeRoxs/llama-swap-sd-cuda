@@ -1,7 +1,7 @@
 FROM node:24-bookworm AS llama-swap-ui-build
 
 ARG LLAMA_SWAP_REPO=https://github.com/mostlygeek/llama-swap.git
-ARG LLAMA_SWAP_COMMIT=63bc2663951241cf1fd19e8253b498a79e11a76a
+ARG LLAMA_SWAP_REF=HEAD
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
@@ -12,7 +12,7 @@ RUN apt-get update \
 WORKDIR /src
 
 RUN git clone --filter=blob:none "${LLAMA_SWAP_REPO}" llama-swap \
- && git -C llama-swap checkout "${LLAMA_SWAP_COMMIT}"
+ && git -C llama-swap checkout "${LLAMA_SWAP_REF}"
 
 WORKDIR /src/llama-swap/ui-svelte
 
@@ -23,7 +23,7 @@ RUN npm ci \
 FROM golang:1.26.1-bookworm AS llama-swap-build
 
 ARG LLAMA_SWAP_REPO=https://github.com/mostlygeek/llama-swap.git
-ARG LLAMA_SWAP_COMMIT=63bc2663951241cf1fd19e8253b498a79e11a76a
+ARG LLAMA_SWAP_REF=HEAD
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
@@ -34,7 +34,7 @@ RUN apt-get update \
 WORKDIR /src
 
 RUN git clone --filter=blob:none "${LLAMA_SWAP_REPO}" llama-swap \
- && git -C llama-swap checkout "${LLAMA_SWAP_COMMIT}"
+ && git -C llama-swap checkout "${LLAMA_SWAP_REF}"
 
 COPY docker/llama-swappo/ollama-api.patch /tmp/ollama-api.patch
 
