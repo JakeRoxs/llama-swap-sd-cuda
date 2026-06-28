@@ -8,10 +8,10 @@ index 7e35477..507b767 100644
 +
 diff --git a/internal/server/ollama.go b/internal/server/ollama.go
 new file mode 100644
-index 0000000..c36091d
+index 0000000..058b6cf
 --- /dev/null
 +++ b/internal/server/ollama.go
-@@ -0,0 +1,1170 @@
+@@ -0,0 +1,1169 @@
 +package server
 +
 +import (
@@ -362,10 +362,9 @@ index 0000000..c36091d
 +
 +	modelInfo := map[string]any{"general.architecture": arch}
 +	ctxLength := details.ContextLength
-+	if ctxLength == 0 {
-+		ctxLength = 2048
++	if ctxLength > 0 {
++		modelInfo[fmt.Sprintf("%s.context_length", arch)] = ctxLength
 +	}
-+	modelInfo[fmt.Sprintf("%s.context_length", arch)] = ctxLength
 +
 +	setOllamaCORS(w, r)
 +	writeOllamaJSON(w, http.StatusOK, ollamaShowResponse{
@@ -1184,10 +1183,10 @@ index 0000000..c36091d
 +}
 diff --git a/internal/server/ollama_metadata.go b/internal/server/ollama_metadata.go
 new file mode 100644
-index 0000000..0a6bce4
+index 0000000..7399bc5
 --- /dev/null
 +++ b/internal/server/ollama_metadata.go
-@@ -0,0 +1,233 @@
+@@ -0,0 +1,246 @@
 +package server
 +
 +import (
@@ -1318,8 +1317,21 @@ index 0000000..0a6bce4
 +	} else {
 +		details.QuantizationLevel = inferOllamaQuantization(model)
 +	}
-+	details.ContextLength = metadataInt(metadata, "contextLength", parsed.ContextLength)
++	details.ContextLength = knownContextLength(modelCfg, parsed.ContextLength)
 +	return details
++}
++
++func knownContextLength(modelCfg config.ModelConfig, parsedContext int) int {
++	if parsedContext > 0 {
++		return parsedContext
++	}
++	if modelCfg.Capabilities.Context > 0 {
++		return modelCfg.Capabilities.Context
++	}
++	if value := metadataInt(modelCfg.Metadata, "contextLength", 0); value > 0 {
++		return value
++	}
++	return metadataInt(modelCfg.Metadata, "context_length", 0)
 +}
 +
 +func ollamaCapabilitiesForModel(modelCfg config.ModelConfig) []string {
