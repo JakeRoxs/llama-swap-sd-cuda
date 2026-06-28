@@ -6,6 +6,13 @@ index 7e35477..507b767 100644
 +	// ChatTemplateKwargs are default chat_template_kwargs for compatible backends.
 +	ChatTemplateKwargs map[string]any `yaml:"chatTemplateKwargs"`
 +
+diff --git a/internal/server/apigroup_test.go b/internal/server/apigroup_test.go
+index a8fa664..bc167fd 100644
+--- a/internal/server/apigroup_test.go
++++ b/internal/server/apigroup_test.go
+@@ -46 +46 @@ func TestServer_APIVersion(t *testing.T) {
+-	if got["version"] != "1.2.3" || got["commit"] != "deadbeef" || got["build_date"] != "2026-05-19" {
++	if got["version"] != "0.13.5" || got["commit"] != "" || got["build_date"] != "" {
 diff --git a/internal/server/ollama.go b/internal/server/ollama.go
 new file mode 100644
 index 0000000..058b6cf
@@ -1434,7 +1441,7 @@ index 0000000..7399bc5
 +	return fmt.Sprintf("%x", sum[:])
 +}
 diff --git a/internal/server/server.go b/internal/server/server.go
-index 0d27d89..ec3b248 100644
+index 0d27d89..2937a01 100644
 --- a/internal/server/server.go
 +++ b/internal/server/server.go
 @@ -209,0 +210,15 @@ func (s *Server) routes() {
@@ -1453,3 +1460,6 @@ index 0d27d89..ec3b248 100644
 +	mux.HandleFunc("POST /api/create", handleOllamaNotImplemented)
 +	mux.HandleFunc("POST /api/delete", handleOllamaNotImplemented)
 +	mux.HandleFunc("POST /api/blobs/{digest}", handleOllamaNotImplemented)
+@@ -255 +270 @@ func (s *Server) routes() {
+-	mux.Handle("GET /api/version", apiChain.ThenFunc(s.handleAPIVersion))
++	mux.HandleFunc("GET /api/version", s.handleOllamaVersion)
