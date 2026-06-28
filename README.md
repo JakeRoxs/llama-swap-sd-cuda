@@ -1,5 +1,7 @@
 # llama-swap-sd-cuda
 
+![License](https://img.shields.io/badge/license-MIT-blue.svg)
+
 Custom `llama-swap` CUDA image based on:
 
 ```text
