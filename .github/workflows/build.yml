@@ -19,20 +19,12 @@ permissions:
 
 env:
   REGISTRY: ghcr.io
+  DEFAULT_IMAGE_NAME: llama-swap-sd-cuda
+  SWAPPO_IMAGE_NAME: llama-swappo-sd-cuda
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - image_name: llama-swap-sd-cuda
-            dockerfile: Dockerfile
-            cache_scope: llama-swap-sd-cuda
-          - image_name: llama-swappo-sd-cuda
-            dockerfile: Dockerfile.llama-swappo
-            cache_scope: llama-swappo-sd-cuda
 
     steps:
       - name: Checkout
@@ -51,15 +43,30 @@ jobs:
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build and push
+      - name: Build and push default image
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: ${{ matrix.dockerfile }}
+          file: Dockerfile
           push: true
           platforms: linux/amd64
           tags: |
-            ${{ env.REGISTRY }}/${{ env.OWNER_LC }}/${{ matrix.image_name }}:latest
-            ${{ env.REGISTRY }}/${{ env.OWNER_LC }}/${{ matrix.image_name }}:${{ github.sha }}
-          cache-from: type=gha,scope=${{ matrix.cache_scope }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.cache_scope }}
+            ${{ env.REGISTRY }}/${{ env.OWNER_LC }}/${{ env.DEFAULT_IMAGE_NAME }}:latest
+            ${{ env.REGISTRY }}/${{ env.OWNER_LC }}/${{ env.DEFAULT_IMAGE_NAME }}:${{ github.sha }}
+          cache-from: type=gha,scope=${{ env.DEFAULT_IMAGE_NAME }}
+          cache-to: type=gha,mode=max,scope=${{ env.DEFAULT_IMAGE_NAME }}
+
+      - name: Build and push swappo image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.llama-swappo
+          push: true
+          platforms: linux/amd64
+          build-args: |
+            LLAMA_SWAP_SD_CUDA_BASE=${{ env.REGISTRY }}/${{ env.OWNER_LC }}/${{ env.DEFAULT_IMAGE_NAME }}:${{ github.sha }}
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.OWNER_LC }}/${{ env.SWAPPO_IMAGE_NAME }}:latest
+            ${{ env.REGISTRY }}/${{ env.OWNER_LC }}/${{ env.SWAPPO_IMAGE_NAME }}:${{ github.sha }}
+          cache-from: type=gha,scope=${{ env.SWAPPO_IMAGE_NAME }}
+          cache-to: type=gha,mode=max,scope=${{ env.SWAPPO_IMAGE_NAME }}

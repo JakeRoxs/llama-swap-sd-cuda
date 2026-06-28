@@ -1,1098 +1,174 @@
-diff --git a/proxy/config/model_config.go b/proxy/config/model_config.go
-index 108e79a..8f798b0 100644
---- a/proxy/config/model_config.go
-+++ b/proxy/config/model_config.go
-@@ -54,6 +54,11 @@ type ModelConfig struct {
- 
- 	// Timeout settings for proxy connections
- 	Timeouts TimeoutsConfig `yaml:"timeouts"`
-+
-+	// ChatTemplateKwargs: default chat_template_kwargs to apply to all requests
-+	// These are merged with request-level values, with request values taking precedence
-+	// Useful for setting model-specific defaults like enable_thinking for Qwen3
+diff --git a/internal/config/model_config.go b/internal/config/model_config.go
+index 7e35477..507b767 100644
+--- a/internal/config/model_config.go
++++ b/internal/config/model_config.go
+@@ -99,0 +100,3 @@ type ModelConfig struct {
++	// ChatTemplateKwargs are default chat_template_kwargs for compatible backends.
 +	ChatTemplateKwargs map[string]any `yaml:"chatTemplateKwargs"`
- }
- 
- func (m *ModelConfig) UnmarshalYAML(unmarshal func(interface{}) error) error {
-diff --git a/proxy/ollama_api.go b/proxy/ollama_api.go
++
+diff --git a/internal/server/ollama.go b/internal/server/ollama.go
 new file mode 100644
-index 0000000..210177b
+index 0000000..c36091d
 --- /dev/null
-+++ b/proxy/ollama_api.go
-@@ -0,0 +1,1624 @@
-+package proxy
++++ b/internal/server/ollama.go
+@@ -0,0 +1,1170 @@
++package server
 +
 +import (
 +	"bufio"
 +	"bytes"
 +	"encoding/json"
 +	"fmt"
++	"io"
 +	"net/http"
 +	"net/http/httptest"
 +	"sort"
 +	"strings"
 +	"time"
 +
-+	"github.com/gin-gonic/gin"
++	"github.com/mostlygeek/llama-swap/internal/shared"
 +)
 +
-+// normalizeKeepAlive converts keep_alive from interface{} to string format
-+// Accepts numbers (int, float64) and converts to duration string, or passes through strings
-+func normalizeKeepAlive(keepAlive interface{}) string {
-+	if keepAlive == nil {
-+		return ""
-+	}
-+
-+	switch v := keepAlive.(type) {
-+	case string:
-+		return v
-+	case int:
-+		// Convert seconds to duration string (e.g., 300 -> "5m")
-+		return fmt.Sprintf("%ds", v)
-+	case float64:
-+		// Convert seconds to duration string, handling fractional seconds with proper rounding
-+		return fmt.Sprintf("%.0fs", v+0.5)
-+	case json.Number:
-+		// Handle JSON numbers that come as string
-+		if num, err := v.Int64(); err == nil {
-+			return fmt.Sprintf("%ds", num)
-+		}
-+		// Try float if int conversion fails
-+		if num, err := v.Float64(); err == nil {
-+			return fmt.Sprintf("%.0fs", num+0.5)
-+		}
-+		return ""
-+	default:
-+		// For any other type, try to convert to string
-+		return fmt.Sprintf("%v", v)
-+	}
-+}
-+
-+func (pm *ProxyManager) sendOllamaError(c *gin.Context, statusCode int, message string) {
-+	c.JSON(statusCode, OllamaErrorResponse{Error: message})
-+}
-+
-+func (pm *ProxyManager) ollamaNotImplementedHandler(c *gin.Context) {
-+	pm.sendOllamaError(c, http.StatusNotImplemented, "This Ollama API endpoint is not implemented in llama-swap.")
-+}
-+
-+func (pm *ProxyManager) ollamaVersionHandler() gin.HandlerFunc {
-+	return func(c *gin.Context) {
-+		// Handle CORS if Origin header is present
-+		if origin := c.Request.Header.Get("Origin"); origin != "" {
-+			c.Header("Access-Control-Allow-Origin", origin)
-+		}
-+		c.JSON(http.StatusOK, OllamaVersionResponse{Version: "0.13.5"}) // Some clients expect a real version
-+	}
-+}
-+
-+func (pm *ProxyManager) ollamaHeartbeatHandler(c *gin.Context) {
-+	c.String(http.StatusOK, "Ollama is running") // Ollama server returns this string
-+}
-+
-+func (pm *ProxyManager) ollamaListTagsHandler() gin.HandlerFunc {
-+	return func(c *gin.Context) {
-+		models := []OllamaModelResponse{}
-+		now := time.Now().UTC() // Use a consistent timestamp
-+
-+		pm.RLock() // Lock for reading pm.config.Models
-+		for id, modelCfg := range pm.config.Models {
-+			if modelCfg.Unlisted {
-+				continue
-+			}
-+			details := OllamaModelDetails{Format: "gguf"}
-+			if family, ok := modelCfg.Metadata["family"].(string); ok && family != "" {
-+				details.Family = family
-+			} else {
-+				// Basic inference for list view
-+				arch := "unknown"
-+				if v, ok := modelCfg.Metadata["architecture"].(string); ok && v != "" {
-+					arch = v
-+				} else {
-+					arch = inferPattern(id, architecturePatterns, orderedArchKeys)
-+				}
-+				details.Family = inferFamilyFromName(id, arch)
-+			}
-+			if paramSize, ok := modelCfg.Metadata["parameterSize"].(string); ok && paramSize != "" {
-+				details.ParameterSize = paramSize
-+			} else {
-+				details.ParameterSize = inferParameterSizeFromName(id)
-+			}
-+			if quantLevel, ok := modelCfg.Metadata["quantizationLevel"].(string); ok && quantLevel != "" {
-+				details.QuantizationLevel = quantLevel
-+			} else {
-+				details.QuantizationLevel = inferQuantizationLevelFromName(id)
-+			}
-+			if details.Family != "unknown" && details.Family != "" {
-+				details.Families = []string{details.Family}
-+			}
-+
-+			models = append(models, OllamaModelResponse{
-+				Name:       id,
-+				Model:      id,
-+				ModifiedAt: now,
-+				Size:       0,
-+				Digest:     fmt.Sprintf("%x", id),
-+				Details:    details,
-+			})
-+		}
-+		pm.RUnlock()
-+
-+		// Handle CORS if Origin header is present
-+		if origin := c.Request.Header.Get("Origin"); origin != "" {
-+			c.Header("Access-Control-Allow-Origin", origin)
-+		}
-+
-+		c.JSON(http.StatusOK, OllamaListTagsResponse{Models: models})
-+	}
-+}
-+
-+func (pm *ProxyManager) ollamaShowHandler() gin.HandlerFunc {
-+	return func(c *gin.Context) {
-+		var req OllamaShowRequest
-+		if err := c.ShouldBindJSON(&req); err != nil {
-+			pm.sendOllamaError(c, http.StatusBadRequest, fmt.Sprintf("Invalid request: %v", err))
-+			return
-+		}
-+
-+		modelName := req.Model
-+		if modelName == "" {
-+			modelName = req.Name
-+		}
-+
-+		if modelName == "" {
-+			pm.sendOllamaError(c, http.StatusBadRequest, "Model name is required.")
-+			return
-+		}
-+
-+		pm.RLock()
-+		modelCfg, id, found := pm.config.FindConfig(modelName) // id is realModelName
-+		pm.RUnlock()
-+
-+		if !found {
-+			pm.sendOllamaError(c, http.StatusNotFound, fmt.Sprintf("Model '%s' not found.", modelName))
-+			return
-+		}
-+
-+		parser := NewLlamaServerParser()
-+		parsedArgs := parser.Parse(modelCfg.Cmd, id)
-+
-+		arch := parsedArgs.Architecture
-+		family := parsedArgs.Family
-+		paramSize := parsedArgs.ParameterSize
-+		quantLevel := parsedArgs.QuantizationLevel
-+		ctxLength := parsedArgs.ContextLength
-+		caps := parsedArgs.Capabilities
-+		if len(caps) == 0 {
-+			caps = []string{"completion"}
-+		}
-+
-+		// Override with metadata if present
-+		if v, ok := modelCfg.Metadata["architecture"].(string); ok && v != "" {
-+			arch = v
-+		}
-+		if v, ok := modelCfg.Metadata["family"].(string); ok && v != "" {
-+			family = v
-+		}
-+		if v, ok := modelCfg.Metadata["parameterSize"].(string); ok && v != "" {
-+			paramSize = v
-+		}
-+		if v, ok := modelCfg.Metadata["quantizationLevel"].(string); ok && v != "" {
-+			quantLevel = v
-+		}
-+		if v, ok := modelCfg.Metadata["contextLength"].(int); ok && v != 0 {
-+			ctxLength = v
-+		}
-+		if v, ok := modelCfg.Metadata["capabilities"].([]any); ok && len(v) > 0 {
-+			newCaps := make([]string, 0, len(v))
-+			for _, item := range v {
-+				if s, isString := item.(string); isString {
-+					newCaps = append(newCaps, s)
-+				}
-+			}
-+			if len(newCaps) > 0 {
-+				caps = newCaps
-+			}
-+		}
-+
-+		details := OllamaModelDetails{
-+			Format:            "gguf",
-+			Family:            family,
-+			ParameterSize:     paramSize,
-+			QuantizationLevel: quantLevel,
-+		}
-+		if family != "unknown" && family != "" {
-+			details.Families = []string{family}
-+		}
-+
-+		modelInfo := map[string]interface{}{
-+			"general.architecture": arch,
-+		}
-+		if ctxLength > 0 {
-+			modelInfo[fmt.Sprintf("%s.context_length", arch)] = ctxLength
-+		} else {
-+			modelInfo[fmt.Sprintf("%s.context_length", arch)] = 2048
-+		}
-+
-+		resp := OllamaShowResponse{
-+			Details:      details,
-+			ModelInfo:    modelInfo,
-+			Capabilities: caps,
-+		}
-+
-+		// Handle CORS if Origin header is present
-+		if origin := c.Request.Header.Get("Origin"); origin != "" {
-+			c.Header("Access-Control-Allow-Origin", origin)
-+		}
-+
-+		c.JSON(http.StatusOK, resp)
-+	}
-+}
-+
-+func (pm *ProxyManager) ollamaPSHandler() gin.HandlerFunc {
-+	return func(c *gin.Context) {
-+		runningModels := []OllamaProcessModelResponse{}
-+		now := time.Now().UTC()
-+
-+		pm.RLock()
-+		for _, group := range pm.processGroups {
-+			group.Lock() // Lock group while iterating its processes
-+			for modelID, process := range group.processes {
-+				if process.CurrentState() == StateReady {
-+					expiresAt := time.Time{} // Zero time if no TTL
-+					if process.config.UnloadAfter > 0 {
-+						expiresAt = process.lastRequestHandled.Add(time.Duration(process.config.UnloadAfter) * time.Second)
-+						if expiresAt.Before(now) && !process.lastRequestHandled.IsZero() {
-+							expiresAt = now.Add(time.Duration(process.config.UnloadAfter) * time.Second)
-+						} else if process.lastRequestHandled.IsZero() {
-+							expiresAt = now.Add(time.Duration(process.config.UnloadAfter) * time.Second)
-+						}
-+					}
-+
-+					modelCfg := process.config
-+					details := OllamaModelDetails{Format: "gguf"}
-+
-+					arch := "unknown"
-+					if v, ok := modelCfg.Metadata["architecture"].(string); ok && v != "" {
-+						arch = v
-+					} else {
-+						arch = inferPattern(modelID, architecturePatterns, orderedArchKeys)
-+					}
-+
-+					if v, ok := modelCfg.Metadata["family"].(string); ok && v != "" {
-+						details.Family = v
-+					} else {
-+						details.Family = inferFamilyFromName(modelID, arch)
-+					}
-+					if v, ok := modelCfg.Metadata["parameterSize"].(string); ok && v != "" {
-+						details.ParameterSize = v
-+					} else {
-+						details.ParameterSize = inferParameterSizeFromName(modelID)
-+					}
-+					if v, ok := modelCfg.Metadata["quantizationLevel"].(string); ok && v != "" {
-+						details.QuantizationLevel = v
-+					} else {
-+						details.QuantizationLevel = inferQuantizationLevelFromName(modelID)
-+					}
-+					if details.Family != "unknown" && details.Family != "" {
-+						details.Families = []string{details.Family}
-+					}
-+
-+					runningModels = append(runningModels, OllamaProcessModelResponse{
-+						Name:      modelID,
-+						Model:     modelID,
-+						Size:      0,
-+						Digest:    fmt.Sprintf("%x", modelID),
-+						Details:   details,
-+						ExpiresAt: expiresAt,
-+						SizeVRAM:  0,
-+					})
-+				}
-+			}
-+			group.Unlock()
-+		}
-+		pm.RUnlock()
-+
-+		// Handle CORS if Origin header is present
-+		if origin := c.Request.Header.Get("Origin"); origin != "" {
-+			c.Header("Access-Control-Allow-Origin", origin)
-+		}
-+
-+		c.JSON(http.StatusOK, OllamaProcessResponse{Models: runningModels})
-+	}
-+}
-+
-+// transformingResponseWriter captures and transforms SSE stream from OpenAI to Ollama format
-+type transformingResponseWriter struct {
-+	ginWriter      gin.ResponseWriter
-+	modelName      string
-+	buffer         bytes.Buffer                 // To handle partial SSE events
-+	isChat         bool                         // True for chat, false for generate
-+	toolCallBuffer map[int]*accumulatedToolCall // Accumulate streaming tool call deltas by index
-+}
-+
-+// accumulatedToolCall collects streaming tool call deltas until complete
-+type accumulatedToolCall struct {
-+	ID        string
-+	Type      string
-+	Name      string
-+	Arguments strings.Builder // accumulate argument fragments
-+}
-+
-+func newTransformingResponseWriter(writer gin.ResponseWriter, modelName string, isChat bool) *transformingResponseWriter {
-+	return &transformingResponseWriter{
-+		ginWriter:      writer,
-+		modelName:      modelName,
-+		isChat:         isChat,
-+		toolCallBuffer: make(map[int]*accumulatedToolCall),
-+	}
-+}
-+
-+func (trw *transformingResponseWriter) Header() http.Header {
-+	return trw.ginWriter.Header()
-+}
-+
-+func (trw *transformingResponseWriter) Write(data []byte) (int, error) {
-+	// Append data to internal buffer
-+	return trw.buffer.Write(data)
-+}
-+
-+func (trw *transformingResponseWriter) WriteHeader(statusCode int) {
-+	trw.ginWriter.WriteHeader(statusCode)
-+}
-+
-+func (trw *transformingResponseWriter) Flush() {
-+	scanner := bufio.NewScanner(&trw.buffer)
-+	var processedBuffer bytes.Buffer // Store fully processed lines to write
-+
-+	var unprocessedSuffix []byte // Store any partial line at the end
-+
-+	for scanner.Scan() {
-+		line := scanner.Text()
-+		if strings.HasPrefix(line, "data: ") {
-+			jsonData := strings.TrimPrefix(line, "data: ")
-+			if jsonData == "[DONE]" {
-+				break
-+			}
-+
-+			var ollamaChunkJSON []byte
-+			var err error
-+
-+			if trw.isChat {
-+				var openAIChatChunk OpenAIStreamingChatResponse
-+				if err = json.Unmarshal([]byte(jsonData), &openAIChatChunk); err == nil {
-+					if len(openAIChatChunk.Choices) > 0 {
-+						choice := openAIChatChunk.Choices[0]
-+						message := OllamaMessage{
-+							Role:     openAIRoleToOllama(choice.Delta.Role),
-+							Content:  choice.Delta.Content,
-+							Thinking: choice.Delta.ReasoningContent,
-+						}
-+
-+						// Handle tool calls in streaming response - ACCUMULATE instead of immediate output
-+						// OpenAI streams tool calls incrementally (ID, name, arguments fragments)
-+						// We collect them until the stream ends, then emit complete tool calls
-+						if len(choice.Delta.ToolCalls) > 0 {
-+							for _, tcDelta := range choice.Delta.ToolCalls {
-+								acc, exists := trw.toolCallBuffer[tcDelta.Index]
-+								if !exists {
-+									acc = &accumulatedToolCall{}
-+									trw.toolCallBuffer[tcDelta.Index] = acc
-+								}
-+								// Accumulate fields (only update if non-empty)
-+								if tcDelta.ID != "" {
-+									acc.ID = tcDelta.ID
-+								}
-+								if tcDelta.Type != "" {
-+									acc.Type = tcDelta.Type
-+								}
-+								if tcDelta.Function.Name != "" {
-+									acc.Name = tcDelta.Function.Name
-+								}
-+								// Arguments come as string fragments - concatenate
-+								acc.Arguments.WriteString(tcDelta.Function.Arguments)
-+							}
-+							// DON'T add tool calls to message yet - emit on final chunk
-+						}
-+
-+						// On final chunk, emit accumulated tool calls
-+						// Ollama-compatible: emit tool_calls with done:false, then final done:true chunk
-+						if choice.FinishReason != "" && len(trw.toolCallBuffer) > 0 {
-+							ollamaToolCalls := make([]OllamaToolCall, 0, len(trw.toolCallBuffer))
-+
-+							// Sort by index for consistent ordering
-+							indices := make([]int, 0, len(trw.toolCallBuffer))
-+							for idx := range trw.toolCallBuffer {
-+								indices = append(indices, idx)
-+							}
-+							sort.Ints(indices)
-+
-+							for _, idx := range indices {
-+								acc := trw.toolCallBuffer[idx]
-+								// Skip invalid tool calls (empty name = hallucinated)
-+								if acc.Name == "" {
-+									continue
-+								}
-+								var args map[string]interface{}
-+								if argsStr := acc.Arguments.String(); argsStr != "" {
-+									json.Unmarshal([]byte(argsStr), &args)
-+								}
-+								ollamaToolCalls = append(ollamaToolCalls, OllamaToolCall{
-+									ID:   acc.ID,
-+									Type: acc.Type,
-+									Function: OllamaToolCallFunc{
-+										Index:     idx,
-+										Name:      acc.Name,
-+										Arguments: args,
-+									},
-+								})
-+							}
-+
-+							if len(ollamaToolCalls) > 0 {
-+								// Emit tool calls chunk with done:false (Ollama-compatible)
-+								toolCallMessage := message
-+								toolCallMessage.ToolCalls = ollamaToolCalls
-+								toolCallResp := OllamaChatResponse{
-+									Model:      trw.modelName,
-+									CreatedAt:  time.Now().UTC(),
-+									Message:    toolCallMessage,
-+									Done:       false, // Tool calls come with done:false
-+									DoneReason: openAIFinishReasonToOllama(choice.FinishReason),
-+								}
-+								if toolCallResp.Message.Role == "" {
-+									toolCallResp.Message.Role = "assistant"
-+								}
-+								toolCallJSON, _ := json.Marshal(toolCallResp)
-+								processedBuffer.Write(toolCallJSON)
-+								processedBuffer.WriteString("\n")
-+
-+								// Now emit final done:true chunk (no tool_calls)
-+								finalResp := OllamaChatResponse{
-+									Model:      trw.modelName,
-+									CreatedAt:  time.Now().UTC(),
-+									Message:    OllamaMessage{Role: "assistant"},
-+									Done:       true,
-+									DoneReason: openAIFinishReasonToOllama(choice.FinishReason),
-+								}
-+								if openAIChatChunk.Usage != nil {
-+									finalResp.PromptEvalCount = openAIChatChunk.Usage.PromptTokens
-+									finalResp.EvalCount = openAIChatChunk.Usage.CompletionTokens
-+								}
-+								ollamaChunkJSON, err = json.Marshal(finalResp)
-+							}
-+						} else {
-+							// Normal case: no tool calls, just emit the chunk as-is
-+							ollamaResp := OllamaChatResponse{
-+								Model:      trw.modelName,
-+								CreatedAt:  time.Now().UTC(),
-+								Message:    message,
-+								Done:       choice.FinishReason != "",
-+								DoneReason: openAIFinishReasonToOllama(choice.FinishReason),
-+							}
-+							if choice.Delta.Role == "" && ollamaResp.Message.Role == "" {
-+								ollamaResp.Message.Role = "assistant"
-+							}
-+							if openAIChatChunk.Usage != nil {
-+								ollamaResp.PromptEvalCount = openAIChatChunk.Usage.PromptTokens
-+								ollamaResp.EvalCount = openAIChatChunk.Usage.CompletionTokens
-+							}
-+
-+							ollamaChunkJSON, err = json.Marshal(ollamaResp)
-+						}
-+					}
-+				}
-+			} else { // /api/generate
-+				var openAIGenChunk OpenAIStreamingCompletionResponse
-+				if err = json.Unmarshal([]byte(jsonData), &openAIGenChunk); err == nil {
-+					if len(openAIGenChunk.Choices) > 0 {
-+						choice := openAIGenChunk.Choices[0]
-+						ollamaResp := OllamaGenerateResponse{
-+							Model:      trw.modelName,
-+							CreatedAt:  time.Now().UTC(),
-+							Response:   choice.Text,
-+							Done:       choice.FinishReason != "",
-+							DoneReason: openAIFinishReasonToOllama(choice.FinishReason),
-+						}
-+						if openAIGenChunk.Usage != nil {
-+							ollamaResp.PromptEvalCount = openAIGenChunk.Usage.PromptTokens
-+							ollamaResp.EvalCount = openAIGenChunk.Usage.CompletionTokens
-+						}
-+						ollamaChunkJSON, err = json.Marshal(ollamaResp)
-+					}
-+				}
-+			}
-+
-+			if err == nil && ollamaChunkJSON != nil {
-+				processedBuffer.Write(ollamaChunkJSON)
-+				processedBuffer.WriteString("\n")
-+			} else if err != nil {
-+				fmt.Fprintf(trw.ginWriter, "{\"error\":\"Error transforming stream: %v\"}\n", err)
-+			}
-+		} else if line != "" {
-+			var errResp OllamaErrorResponse
-+			if json.Unmarshal([]byte(line), &errResp) == nil && errResp.Error != "" {
-+				processedBuffer.Write([]byte(line))
-+				processedBuffer.WriteString("\n")
-+			}
-+		}
-+	}
-+	if err := scanner.Err(); err != nil {
-+		fmt.Fprintf(trw.ginWriter, "{\"error\":\"Error scanning stream buffer: %v\"}\n", err)
-+	}
-+
-+	// If there is any unprocessed suffix, write it back to the buffer
-+	unprocessedSuffix = nil
-+	if trw.buffer.Len() > 0 && len(scanner.Bytes()) > 0 && trw.buffer.Len() >= len(scanner.Bytes()) {
-+		unprocessedSuffix = trw.buffer.Bytes()[trw.buffer.Len()-len(scanner.Bytes()):]
-+	}
-+	trw.buffer.Reset()
-+	if unprocessedSuffix != nil {
-+		trw.buffer.Write(unprocessedSuffix)
-+	}
-+
-+	if processedBuffer.Len() > 0 {
-+		trw.ginWriter.Write(processedBuffer.Bytes())
-+	}
-+	if flusher, ok := trw.ginWriter.(http.Flusher); ok {
-+		flusher.Flush()
-+	}
-+}
-+
-+func (pm *ProxyManager) ollamaChatHandler() gin.HandlerFunc {
-+	return func(c *gin.Context) {
-+		var ollamaReq OllamaChatRequest
-+		if err := c.ShouldBindJSON(&ollamaReq); err != nil {
-+			pm.sendOllamaError(c, http.StatusBadRequest, fmt.Sprintf("Invalid request: %v", err))
-+			return
-+		}
-+
-+		// Validate tool request
-+		if err := validateToolRequest(&ollamaReq); err != nil {
-+			pm.sendOllamaError(c, http.StatusBadRequest, err.Error())
-+			return
-+		}
-+
-+		// Normalize keep_alive field to handle both numeric and string inputs
-+		normalizedKeepAlive := normalizeKeepAlive(ollamaReq.KeepAlive)
-+		if normalizedKeepAlive != "" {
-+			ollamaReq.KeepAlive = normalizedKeepAlive
-+		}
-+
-+		if ollamaReq.Model == "" {
-+			pm.sendOllamaError(c, http.StatusBadRequest, "Model name is required.")
-+			return
-+		}
-+
-+		pg, err := pm.swapProcessGroup(ollamaReq.Model)
-+		realModelName := ollamaReq.Model
-+		if err != nil {
-+			pm.sendOllamaError(c, http.StatusInternalServerError, fmt.Sprintf("Error selecting model process: %v", err))
-+			return
-+		}
-+
-+		process, ok := pg.processes[realModelName]
-+		if !ok {
-+			pm.sendOllamaError(c, http.StatusInternalServerError, fmt.Sprintf("Process for model %s not found in group %s", realModelName, pg.id))
-+			return
-+		}
-+
-+		openAIMessages := ollamaMessagesToOpenAI(ollamaReq.Messages)
-+		openAITools := ollamaToolsToOpenAI(ollamaReq.Tools)
-+		modelNameToUse := realModelName
-+		if pm.config.Models[realModelName].UseModelName != "" {
-+			modelNameToUse = pm.config.Models[realModelName].UseModelName
-+		}
-+
-+		isStreaming := ollamaReq.Stream != nil && *ollamaReq.Stream
-+		opts := &createOpenAIRequestBodyOptions{
-+			Think:  ollamaReq.Think,
-+			Format: ollamaReq.Format,
-+		}
-+		openAIReqBodyBytes, err := createOpenAIRequestBody(modelNameToUse, openAIMessages, isStreaming, ollamaReq.Options, openAITools, ollamaReq.ToolChoice, opts)
-+		if err != nil {
-+			pm.sendOllamaError(c, http.StatusInternalServerError, fmt.Sprintf("Error creating OpenAI request: %v", err))
-+			return
-+		}
-+
-+		proxyDestReq, err := http.NewRequestWithContext(c.Request.Context(), "POST", "/v1/chat/completions", bytes.NewBuffer(openAIReqBodyBytes))
-+		if err != nil {
-+			pm.sendOllamaError(c, http.StatusInternalServerError, fmt.Sprintf("Error creating internal request: %v", err))
-+			return
-+		}
-+		proxyDestReq.Header.Set("Content-Type", "application/json")
-+		proxyDestReq.Header.Set("Accept", "application/json, text/event-stream")
-+		proxyDestReq.Header.Set("Content-Length", fmt.Sprintf("%d", len(openAIReqBodyBytes)))
-+
-+		if isStreaming {
-+			c.Header("Content-Type", "application/x-ndjson")
-+			c.Header("Transfer-Encoding", "chunked")
-+			c.Header("Cache-Control", "no-cache")
-+			c.Header("Connection", "keep-alive")
-+
-+			trw := newTransformingResponseWriter(c.Writer, ollamaReq.Model, true)
-+			process.ProxyRequest(trw, proxyDestReq)
-+			trw.Flush()
-+		} else {
-+			recorder := httptest.NewRecorder()
-+			process.ProxyRequest(recorder, proxyDestReq)
-+
-+			if recorder.Code != http.StatusOK {
-+				var openAIError struct {
-+					Error struct {
-+						Message string `json:"message"`
-+						Type    string `json:"type"`
-+					} `json:"error"`
-+				}
-+				if json.Unmarshal(recorder.Body.Bytes(), &openAIError) == nil && openAIError.Error.Message != "" {
-+					pm.sendOllamaError(c, recorder.Code, openAIError.Error.Message)
-+				} else {
-+					pm.sendOllamaError(c, recorder.Code, fmt.Sprintf("Upstream error: %s", recorder.Body.String()))
-+				}
-+				return
-+			}
-+
-+			var openAIResp OpenAIChatCompletionResponse
-+			if err := json.Unmarshal(recorder.Body.Bytes(), &openAIResp); err != nil {
-+				pm.sendOllamaError(c, http.StatusInternalServerError, fmt.Sprintf("Error parsing OpenAI response: %v. Body: %s", err, recorder.Body.String()))
-+				return
-+			}
-+
-+			if len(openAIResp.Choices) == 0 {
-+				pm.sendOllamaError(c, http.StatusInternalServerError, "OpenAI response contained no choices.")
-+				return
-+			}
-+
-+			choice := openAIResp.Choices[0]
-+			message := OllamaMessage{
-+				Role:     openAIRoleToOllama(choice.Message.Role),
-+				Content:  choice.Message.Content,
-+				Thinking: choice.Message.ReasoningContent,
-+			}
-+
-+			// Handle tool calls in the response
-+			if len(choice.Message.ToolCalls) > 0 {
-+				message.ToolCalls = openAIToolCallsToOllama(choice.Message.ToolCalls)
-+			}
-+
-+			ollamaFinalResp := OllamaChatResponse{
-+				Model:           ollamaReq.Model,
-+				CreatedAt:       time.Unix(openAIResp.Created, 0).UTC(),
-+				Message:         message,
-+				Done:            true,
-+				DoneReason:      openAIFinishReasonToOllama(choice.FinishReason),
-+				TotalDuration:   0,
-+				LoadDuration:    0,
-+				PromptEvalCount: openAIResp.Usage.PromptTokens,
-+				EvalCount:       openAIResp.Usage.CompletionTokens,
-+			}
-+
-+			// CORS handling (avoid duplicate header)
-+			if origin := c.Request.Header.Get("Origin"); origin != "" {
-+				if _, exists := c.Writer.Header()["Access-Control-Allow-Origin"]; !exists {
-+					c.Header("Access-Control-Allow-Origin", origin)
-+				}
-+			}
-+
-+			c.JSON(http.StatusOK, ollamaFinalResp)
-+		}
-+	}
-+}
-+
-+func (pm *ProxyManager) ollamaGenerateHandler() gin.HandlerFunc {
-+	return func(c *gin.Context) {
-+		var ollamaReq OllamaGenerateRequest
-+		if err := c.ShouldBindJSON(&ollamaReq); err != nil {
-+			pm.sendOllamaError(c, http.StatusBadRequest, fmt.Sprintf("Invalid request: %v", err))
-+			return
-+		}
-+
-+		// Normalize keep_alive field to handle both numeric and string inputs
-+		normalizedKeepAlive := normalizeKeepAlive(ollamaReq.KeepAlive)
-+		if normalizedKeepAlive != "" {
-+			ollamaReq.KeepAlive = normalizedKeepAlive
-+		}
-+
-+		if ollamaReq.Model == "" {
-+			pm.sendOllamaError(c, http.StatusBadRequest, "Model name is required.")
-+			return
-+		}
-+		if ollamaReq.Raw {
-+			pm.sendOllamaError(c, http.StatusNotImplemented, "Raw mode for /api/generate is not implemented.")
-+			return
-+		}
-+		if len(ollamaReq.Images) > 0 {
-+			pm.sendOllamaError(c, http.StatusNotImplemented, "Image input for /api/generate is not implemented.")
-+			return
-+		}
-+
-+		pg, err := pm.swapProcessGroup(ollamaReq.Model)
-+		realModelName := ollamaReq.Model
-+		if err != nil {
-+			pm.sendOllamaError(c, http.StatusInternalServerError, fmt.Sprintf("Error selecting model process: %v", err))
-+			return
-+		}
-+
-+		process, ok := pg.processes[realModelName]
-+		if !ok {
-+			pm.sendOllamaError(c, http.StatusInternalServerError, fmt.Sprintf("Process for model %s not found in group %s", realModelName, pg.id))
-+			return
-+		}
-+
-+		modelNameToUse := realModelName
-+		if pm.config.Models[realModelName].UseModelName != "" {
-+			modelNameToUse = pm.config.Models[realModelName].UseModelName
-+		}
-+
-+		isStreaming := ollamaReq.Stream != nil && *ollamaReq.Stream
-+		fullPrompt := ollamaReq.Prompt
-+		if ollamaReq.System != "" {
-+			fullPrompt = ollamaReq.System + "\n\n" + ollamaReq.Prompt
-+		}
-+
-+		openAIReqBodyBytes, err := createOpenAILegacyCompletionRequestBody(modelNameToUse, fullPrompt, isStreaming, ollamaReq.Options)
-+		if err != nil {
-+			pm.sendOllamaError(c, http.StatusInternalServerError, fmt.Sprintf("Error creating OpenAI request: %v", err))
-+			return
-+		}
-+
-+		proxyDestReq, err := http.NewRequestWithContext(c.Request.Context(), "POST", "/v1/completions", bytes.NewBuffer(openAIReqBodyBytes))
-+		if err != nil {
-+			pm.sendOllamaError(c, http.StatusInternalServerError, fmt.Sprintf("Error creating internal request: %v", err))
-+			return
-+		}
-+		proxyDestReq.Header.Set("Content-Type", "application/json")
-+		proxyDestReq.Header.Set("Accept", "application/json, text/event-stream")
-+		proxyDestReq.Header.Set("Content-Length", fmt.Sprintf("%d", len(openAIReqBodyBytes)))
-+
-+		if isStreaming {
-+			c.Header("Content-Type", "application/x-ndjson")
-+			c.Header("Transfer-Encoding", "chunked")
-+			c.Header("Cache-Control", "no-cache")
-+			c.Header("Connection", "keep-alive")
-+
-+			trw := newTransformingResponseWriter(c.Writer, ollamaReq.Model, false)
-+			process.ProxyRequest(trw, proxyDestReq)
-+			trw.Flush()
-+		} else {
-+			recorder := httptest.NewRecorder()
-+			process.ProxyRequest(recorder, proxyDestReq)
-+
-+			if recorder.Code != http.StatusOK {
-+				var openAIError struct {
-+					Error struct {
-+						Message string `json:"message"`
-+					} `json:"error"`
-+				}
-+				if json.Unmarshal(recorder.Body.Bytes(), &openAIError) == nil && openAIError.Error.Message != "" {
-+					pm.sendOllamaError(c, recorder.Code, openAIError.Error.Message)
-+				} else {
-+					pm.sendOllamaError(c, recorder.Code, fmt.Sprintf("Upstream error: %s", recorder.Body.String()))
-+				}
-+				return
-+			}
-+
-+			var openAIResp OpenAICompletionResponse
-+			if err := json.Unmarshal(recorder.Body.Bytes(), &openAIResp); err != nil {
-+				pm.sendOllamaError(c, http.StatusInternalServerError, fmt.Sprintf("Error parsing OpenAI response: %v. Body: %s", err, recorder.Body.String()))
-+				return
-+			}
-+
-+			if len(openAIResp.Choices) == 0 {
-+				pm.sendOllamaError(c, http.StatusInternalServerError, "OpenAI response contained no choices.")
-+				return
-+			}
-+
-+			choice := openAIResp.Choices[0]
-+			ollamaFinalResp := OllamaGenerateResponse{
-+				Model:           ollamaReq.Model,
-+				CreatedAt:       time.Unix(openAIResp.Created, 0).UTC(),
-+				Response:        choice.Text,
-+				Done:            true,
-+				DoneReason:      openAIFinishReasonToOllama(choice.FinishReason),
-+				PromptEvalCount: openAIResp.Usage.PromptTokens,
-+				EvalCount:       openAIResp.Usage.CompletionTokens,
-+			}
-+
-+			// CORS handling (avoid duplicate header)
-+			if origin := c.Request.Header.Get("Origin"); origin != "" {
-+				if _, exists := c.Writer.Header()["Access-Control-Allow-Origin"]; !exists {
-+					c.Header("Access-Control-Allow-Origin", origin)
-+				}
-+			}
-+
-+			c.JSON(http.StatusOK, ollamaFinalResp)
-+		}
-+	}
-+}
-+
-+func (pm *ProxyManager) ollamaEmbedHandler() gin.HandlerFunc {
-+	return func(c *gin.Context) {
-+		var req OllamaEmbedRequest
-+		if err := c.ShouldBindJSON(&req); err != nil {
-+			pm.sendOllamaError(c, http.StatusBadRequest, fmt.Sprintf("Invalid request: %v", err))
-+			return
-+		}
-+
-+		// Normalize keep_alive field to handle both numeric and string inputs
-+		normalizedKeepAlive := normalizeKeepAlive(req.KeepAlive)
-+		if normalizedKeepAlive != "" {
-+			req.KeepAlive = normalizedKeepAlive
-+		}
-+
-+		if req.Model == "" {
-+			pm.sendOllamaError(c, http.StatusBadRequest, "Model name is required.")
-+			return
-+		}
-+
-+		pg, err := pm.swapProcessGroup(req.Model)
-+		realModelName := req.Model
-+		if err != nil {
-+			pm.sendOllamaError(c, http.StatusInternalServerError, fmt.Sprintf("Error selecting model process: %v", err))
-+			return
-+		}
-+		process, ok := pg.processes[realModelName]
-+		if !ok {
-+			pm.sendOllamaError(c, http.StatusInternalServerError, fmt.Sprintf("Process for model %s not found in group %s", realModelName, pg.id))
-+			return
-+		}
-+
-+		modelNameToUse := realModelName
-+		if pm.config.Models[realModelName].UseModelName != "" {
-+			modelNameToUse = pm.config.Models[realModelName].UseModelName
-+		}
-+
-+		// Prepare OpenAI embeddings request
-+		openAIReq := map[string]interface{}{
-+			"model": modelNameToUse,
-+		}
-+		switch v := req.Input.(type) {
-+		case string:
-+			openAIReq["input"] = v
-+		case []interface{}:
-+			openAIReq["input"] = v
-+		default:
-+			openAIReq["input"] = req.Input
-+		}
-+		if req.Options != nil {
-+			for k, v := range req.Options {
-+				openAIReq[k] = v
-+			}
-+		}
-+
-+		openAIReqBody, err := json.Marshal(openAIReq)
-+		if err != nil {
-+			pm.sendOllamaError(c, http.StatusInternalServerError, fmt.Sprintf("Error marshaling OpenAI request: %v", err))
-+			return
-+		}
-+
-+		proxyDestReq, err := http.NewRequestWithContext(c.Request.Context(), "POST", "/v1/embeddings", bytes.NewBuffer(openAIReqBody))
-+		if err != nil {
-+			pm.sendOllamaError(c, http.StatusInternalServerError, fmt.Sprintf("Error creating internal request: %v", err))
-+			return
-+		}
-+
-+		proxyDestReq.Header.Set("Content-Type", "application/json")
-+		proxyDestReq.Header.Set("Accept", "application/json")
-+		proxyDestReq.Header.Set("Content-Length", fmt.Sprintf("%d", len(openAIReqBody)))
-+
-+		recorder := httptest.NewRecorder()
-+		process.ProxyRequest(recorder, proxyDestReq)
-+
-+		// CORS handling
-+		if origin := c.Request.Header.Get("Origin"); origin != "" {
-+			if _, exists := c.Writer.Header()["Access-Control-Allow-Origin"]; !exists {
-+				c.Header("Access-Control-Allow-Origin", origin)
-+			}
-+		}
-+
-+		if recorder.Code != http.StatusOK {
-+			var openAIError struct {
-+				Error struct {
-+					Message string `json:"message"`
-+				} `json:"error"`
-+			}
-+			if json.Unmarshal(recorder.Body.Bytes(), &openAIError) == nil && openAIError.Error.Message != "" {
-+				pm.sendOllamaError(c, recorder.Code, openAIError.Error.Message)
-+			} else {
-+				pm.sendOllamaError(c, recorder.Code, fmt.Sprintf("Upstream error: %s", recorder.Body.String()))
-+			}
-+			return
-+		}
-+
-+		// Parse OpenAI response and transform to Ollama format
-+		var openAIResp struct {
-+			Object string `json:"object"`
-+			Model  string `json:"model"`
-+			Data   []struct {
-+				Embedding []float32 `json:"embedding"`
-+			} `json:"data"`
-+			Usage struct {
-+				PromptTokens int `json:"prompt_tokens"`
-+			} `json:"usage"`
-+		}
-+		if err := json.Unmarshal(recorder.Body.Bytes(), &openAIResp); err != nil {
-+			pm.sendOllamaError(c, http.StatusInternalServerError, fmt.Sprintf("Error parsing OpenAI response: %v. Body: %s", err, recorder.Body.String()))
-+			return
-+		}
-+
-+		embeddings := make([][]float32, len(openAIResp.Data))
-+		for i, d := range openAIResp.Data {
-+			embeddings[i] = d.Embedding
-+		}
-+
-+		resp := OllamaEmbedResponse{
-+			Model:           req.Model,
-+			Embeddings:      embeddings,
-+			PromptEvalCount: openAIResp.Usage.PromptTokens,
-+		}
-+
-+		c.JSON(http.StatusOK, resp)
-+	}
-+}
-+
-+func (pm *ProxyManager) ollamaLegacyEmbeddingsHandler() gin.HandlerFunc {
-+	return func(c *gin.Context) {
-+		var req OllamaLegacyEmbeddingsRequest
-+		if err := c.ShouldBindJSON(&req); err != nil {
-+			pm.sendOllamaError(c, http.StatusBadRequest, fmt.Sprintf("Invalid request: %v", err))
-+			return
-+		}
-+
-+		// Normalize keep_alive field to handle both numeric and string inputs
-+		normalizedKeepAlive := normalizeKeepAlive(req.KeepAlive)
-+		if normalizedKeepAlive != "" {
-+			req.KeepAlive = normalizedKeepAlive
-+		}
-+
-+		if req.Model == "" {
-+			pm.sendOllamaError(c, http.StatusBadRequest, "Model name is required.")
-+			return
-+		}
-+		if req.Prompt == "" {
-+			pm.sendOllamaError(c, http.StatusBadRequest, "Prompt is required.")
-+			return
-+		}
-+
-+		pg, err := pm.swapProcessGroup(req.Model)
-+		realModelName := req.Model
-+		if err != nil {
-+			pm.sendOllamaError(c, http.StatusInternalServerError, fmt.Sprintf("Error selecting model process: %v", err))
-+			return
-+		}
-+		process, ok := pg.processes[realModelName]
-+		if !ok {
-+			pm.sendOllamaError(c, http.StatusInternalServerError, fmt.Sprintf("Process for model %s not found in group %s", realModelName, pg.id))
-+			return
-+		}
-+
-+		modelNameToUse := realModelName
-+		if pm.config.Models[realModelName].UseModelName != "" {
-+			modelNameToUse = pm.config.Models[realModelName].UseModelName
-+		}
-+
-+		// Prepare OpenAI embeddings request
-+		openAIReq := map[string]interface{}{
-+			"model": modelNameToUse,
-+			"input": req.Prompt,
-+		}
-+		if req.Options != nil {
-+			for k, v := range req.Options {
-+				openAIReq[k] = v
-+			}
-+		}
-+
-+		openAIReqBody, err := json.Marshal(openAIReq)
-+		if err != nil {
-+			pm.sendOllamaError(c, http.StatusInternalServerError, fmt.Sprintf("Error marshaling OpenAI request: %v", err))
-+			return
-+		}
-+
-+		proxyDestReq, err := http.NewRequestWithContext(c.Request.Context(), "POST", "/v1/embeddings", bytes.NewBuffer(openAIReqBody))
-+		if err != nil {
-+			pm.sendOllamaError(c, http.StatusInternalServerError, fmt.Sprintf("Error creating internal request: %v", err))
-+			return
-+		}
-+		proxyDestReq.Header.Set("Content-Type", "application/json")
-+		proxyDestReq.Header.Set("Accept", "application/json")
-+		proxyDestReq.Header.Set("Content-Length", fmt.Sprintf("%d", len(openAIReqBody)))
-+
-+		recorder := httptest.NewRecorder()
-+		process.ProxyRequest(recorder, proxyDestReq)
-+
-+		// CORS handling
-+		if origin := c.Request.Header.Get("Origin"); origin != "" {
-+			if _, exists := c.Writer.Header()["Access-Control-Allow-Origin"]; !exists {
-+				c.Header("Access-Control-Allow-Origin", origin)
-+			}
-+		}
-+
-+		if recorder.Code != http.StatusOK {
-+			var openAIError struct {
-+				Error struct {
-+					Message string `json:"message"`
-+				} `json:"error"`
-+			}
-+			if json.Unmarshal(recorder.Body.Bytes(), &openAIError) == nil && openAIError.Error.Message != "" {
-+				pm.sendOllamaError(c, recorder.Code, openAIError.Error.Message)
-+			} else {
-+				pm.sendOllamaError(c, recorder.Code, fmt.Sprintf("Upstream error: %s", recorder.Body.String()))
-+			}
-+			return
-+		}
-+
-+		// Parse OpenAI response and transform to Ollama legacy format
-+		var openAIResp struct {
-+			Data []struct {
-+				Embedding []float32 `json:"embedding"`
-+			} `json:"data"`
-+		}
-+		if err := json.Unmarshal(recorder.Body.Bytes(), &openAIResp); err != nil {
-+			pm.sendOllamaError(c, http.StatusInternalServerError, fmt.Sprintf("Error parsing OpenAI response: %v. Body: %s", err, recorder.Body.String()))
-+			return
-+		}
-+		if len(openAIResp.Data) == 0 {
-+			pm.sendOllamaError(c, http.StatusInternalServerError, "OpenAI response contained no embeddings.")
-+			return
-+		}
-+
-+		resp := OllamaLegacyEmbeddingsResponse{
-+			Embedding: openAIResp.Data[0].Embedding,
-+		}
-+
-+		c.JSON(http.StatusOK, resp)
-+	}
-+}
-+
-+// OllamaErrorResponse is the standard error format for Ollama API.
-+type OllamaErrorResponse struct {
++type ollamaErrorResponse struct {
 +	Error string `json:"error"`
 +}
 +
-+// OllamaVersionResponse defines the structure for the /api/version endpoint.
-+type OllamaVersionResponse struct {
++type ollamaVersionResponse struct {
 +	Version string `json:"version"`
 +}
 +
-+// OllamaGenerateRequest describes a request to /api/generate.
-+type OllamaGenerateRequest struct {
-+	Model     string                 `json:"model"`
-+	Prompt    string                 `json:"prompt"`
-+	System    string                 `json:"system,omitempty"`
-+	Template  string                 `json:"template,omitempty"`
-+	Context   []int                  `json:"context,omitempty"`
-+	Stream    *bool                  `json:"stream,omitempty"`
-+	Raw       bool                   `json:"raw,omitempty"`
-+	Format    string                 `json:"format,omitempty"`
-+	Images    []string               `json:"images,omitempty"`
-+	KeepAlive interface{}            `json:"keep_alive,omitempty"`
-+	Options   map[string]interface{} `json:"options,omitempty"`
++type ollamaModelDetails struct {
++	ParentModel       string   `json:"parent_model,omitempty"`
++	Format            string   `json:"format,omitempty"`
++	Family            string   `json:"family,omitempty"`
++	Families          []string `json:"families,omitempty"`
++	ParameterSize     string   `json:"parameter_size,omitempty"`
++	QuantizationLevel string   `json:"quantization_level,omitempty"`
++	ContextLength     int      `json:"context_length,omitempty"`
 +}
 +
-+// OllamaGenerateResponse is the response from /api/generate.
-+type OllamaGenerateResponse struct {
++type ollamaModelResponse struct {
++	Name         string             `json:"name"`
++	Model        string             `json:"model"`
++	ModifiedAt   time.Time          `json:"modified_at"`
++	Size         int64              `json:"size"`
++	Digest       string             `json:"digest"`
++	Details      ollamaModelDetails `json:"details"`
++	Capabilities []string           `json:"capabilities,omitempty"`
++}
++
++type ollamaShowRequest struct {
++	Model string `json:"model,omitempty"`
++	Name  string `json:"name,omitempty"`
++}
++
++type ollamaShowResponse struct {
++	License      string             `json:"license,omitempty"`
++	Modelfile    string             `json:"modelfile,omitempty"`
++	Parameters   string             `json:"parameters,omitempty"`
++	Template     string             `json:"template,omitempty"`
++	System       string             `json:"system,omitempty"`
++	Details      ollamaModelDetails `json:"details,omitempty"`
++	Messages     []ollamaMessage    `json:"messages,omitempty"`
++	ModelInfo    map[string]any     `json:"model_info,omitempty"`
++	Capabilities []string           `json:"capabilities,omitempty"`
++	ModifiedAt   time.Time          `json:"modified_at,omitempty"`
++}
++
++type ollamaProcessResponse struct {
++	Models []ollamaProcessModelResponse `json:"models"`
++}
++
++type ollamaProcessModelResponse struct {
++	Name      string             `json:"name"`
++	Model     string             `json:"model"`
++	Size      int64              `json:"size"`
++	Digest    string             `json:"digest"`
++	Details   ollamaModelDetails `json:"details"`
++	ExpiresAt time.Time          `json:"expires_at"`
++	SizeVRAM  int64              `json:"size_vram"`
++}
++
++type ollamaTool struct {
++	Type     string             `json:"type"`
++	Function ollamaToolFunction `json:"function"`
++}
++
++type ollamaToolFunction struct {
++	Name        string         `json:"name"`
++	Description string         `json:"description,omitempty"`
++	Parameters  map[string]any `json:"parameters"`
++}
++
++type ollamaToolCall struct {
++	ID       string             `json:"id,omitempty"`
++	Type     string             `json:"type,omitempty"`
++	Function ollamaToolCallFunc `json:"function"`
++}
++
++type ollamaToolCallFunc struct {
++	Index     int            `json:"index,omitempty"`
++	Name      string         `json:"name"`
++	Arguments map[string]any `json:"arguments"`
++}
++
++type ollamaMessage struct {
++	Role       string           `json:"role"`
++	Content    string           `json:"content"`
++	Thinking   string           `json:"thinking,omitempty"`
++	Images     []string         `json:"images,omitempty"`
++	ToolCalls  []ollamaToolCall `json:"tool_calls,omitempty"`
++	ToolCallID string           `json:"tool_call_id,omitempty"`
++	ToolName   string           `json:"tool_name,omitempty"`
++}
++
++type ollamaChatRequest struct {
++	Model      string          `json:"model"`
++	Messages   []ollamaMessage `json:"messages"`
++	Stream     *bool           `json:"stream,omitempty"`
++	Format     any             `json:"format,omitempty"`
++	KeepAlive  any             `json:"keep_alive,omitempty"`
++	Options    map[string]any  `json:"options,omitempty"`
++	Tools      []ollamaTool    `json:"tools,omitempty"`
++	ToolChoice any             `json:"tool_choice,omitempty"`
++	Think      any             `json:"think,omitempty"`
++}
++
++type ollamaChatResponse struct {
++	Model              string        `json:"model"`
++	CreatedAt          time.Time     `json:"created_at"`
++	Message            ollamaMessage `json:"message,omitempty"`
++	Done               bool          `json:"done"`
++	DoneReason         string        `json:"done_reason,omitempty"`
++	TotalDuration      int64         `json:"total_duration,omitempty"`
++	LoadDuration       int64         `json:"load_duration,omitempty"`
++	PromptEvalCount    int           `json:"prompt_eval_count,omitempty"`
++	PromptEvalDuration int64         `json:"prompt_eval_duration,omitempty"`
++	EvalCount          int           `json:"eval_count,omitempty"`
++	EvalDuration       int64         `json:"eval_duration,omitempty"`
++}
++
++type ollamaGenerateRequest struct {
++	Model     string         `json:"model"`
++	Prompt    string         `json:"prompt"`
++	Suffix    string         `json:"suffix,omitempty"`
++	System    string         `json:"system,omitempty"`
++	Template  string         `json:"template,omitempty"`
++	Context   []int          `json:"context,omitempty"`
++	Stream    *bool          `json:"stream,omitempty"`
++	Raw       bool           `json:"raw,omitempty"`
++	Format    any            `json:"format,omitempty"`
++	KeepAlive any            `json:"keep_alive,omitempty"`
++	Images    []string       `json:"images,omitempty"`
++	Options   map[string]any `json:"options,omitempty"`
++	Think     any            `json:"think,omitempty"`
++}
++
++type ollamaGenerateResponse struct {
 +	Model              string    `json:"model"`
 +	CreatedAt          time.Time `json:"created_at"`
-+	Response           string    `json:"response,omitempty"`
++	Response           string    `json:"response"`
++	Thinking           string    `json:"thinking,omitempty"`
 +	Done               bool      `json:"done"`
 +	DoneReason         string    `json:"done_reason,omitempty"`
 +	Context            []int     `json:"context,omitempty"`
@@ -1104,491 +180,981 @@ index 0000000..210177b
 +	EvalDuration       int64     `json:"eval_duration,omitempty"`
 +}
 +
-+// Tool definition types
-+type OllamaTool struct {
-+	Type     string             `json:"type"`
-+	Function OllamaToolFunction `json:"function"`
++type ollamaEmbedRequest struct {
++	Model     string         `json:"model"`
++	Input     any            `json:"input"`
++	Truncate  *bool          `json:"truncate,omitempty"`
++	Options   map[string]any `json:"options,omitempty"`
++	KeepAlive any            `json:"keep_alive,omitempty"`
 +}
 +
-+type OllamaToolFunction struct {
-+	Name        string                 `json:"name"`
-+	Description string                 `json:"description"`
-+	Parameters  map[string]interface{} `json:"parameters"`
++type ollamaLegacyEmbeddingsRequest struct {
++	Model     string         `json:"model"`
++	Prompt    string         `json:"prompt"`
++	Options   map[string]any `json:"options,omitempty"`
++	KeepAlive any            `json:"keep_alive,omitempty"`
 +}
 +
-+// Tool call types - Compatible with both Ollama native and OpenAI formats
-+type OllamaToolCall struct {
-+	ID       string             `json:"id,omitempty"`   // Optional for compatibility with older Ollama
-+	Type     string             `json:"type,omitempty"` // Optional - Zed doesn't send this
-+	Function OllamaToolCallFunc `json:"function"`
-+}
-+
-+type OllamaToolCallFunc struct {
-+	Index     int                    `json:"index,omitempty"` // Optional
-+	Name      string                 `json:"name"`
-+	Arguments map[string]interface{} `json:"arguments"`
-+}
-+
-+// OllamaMessage represents a single message in a chat.
-+type OllamaMessage struct {
-+	Role       string           `json:"role"`
-+	Content    string           `json:"content"`
-+	Thinking   string           `json:"thinking,omitempty"` // Reasoning trace for thinking models (from OpenAI reasoning_content)
-+	Images     []string         `json:"images,omitempty"`
-+	ToolCalls  []OllamaToolCall `json:"tool_calls,omitempty"`
-+	ToolCallID string           `json:"tool_call_id,omitempty"` // For tool role messages (OpenAI style)
-+	ToolName   string           `json:"tool_name,omitempty"`    // For tool role messages (Ollama native style)
-+}
-+
-+// OllamaChatRequest describes a request to /api/chat.
-+type OllamaChatRequest struct {
-+	Model      string                 `json:"model"`
-+	Messages   []OllamaMessage        `json:"messages"`
-+	Stream     *bool                  `json:"stream,omitempty"`
-+	Format     interface{}            `json:"format,omitempty"` // string "json" or JSON Schema object
-+	KeepAlive  interface{}            `json:"keep_alive,omitempty"`
-+	Options    map[string]interface{} `json:"options,omitempty"`
-+	Tools      []OllamaTool           `json:"tools,omitempty"`
-+	ToolChoice interface{}            `json:"tool_choice,omitempty"`
-+	Think      *bool                  `json:"think,omitempty"` // Enable/disable thinking mode for reasoning models
-+}
-+
-+// OllamaChatResponse is the response from /api/chat.
-+type OllamaChatResponse struct {
-+	Model              string        `json:"model"`
-+	CreatedAt          time.Time     `json:"created_at"`
-+	Message            OllamaMessage `json:"message,omitempty"`
-+	Done               bool          `json:"done"`
-+	DoneReason         string        `json:"done_reason,omitempty"`
-+	TotalDuration      int64         `json:"total_duration,omitempty"`
-+	LoadDuration       int64         `json:"load_duration,omitempty"`
-+	PromptEvalCount    int           `json:"prompt_eval_count,omitempty"`
-+	PromptEvalDuration int64         `json:"prompt_eval_duration,omitempty"`
-+	EvalCount          int           `json:"eval_count,omitempty"`
-+	EvalDuration       int64         `json:"eval_duration,omitempty"`
-+}
-+
-+// OllamaListTagsResponse is the response from /api/tags.
-+type OllamaListTagsResponse struct {
-+	Models []OllamaModelResponse `json:"models"`
-+}
-+
-+// OllamaModelResponse describes a single model in the list.
-+type OllamaModelResponse struct {
-+	Name       string             `json:"name"`
-+	Model      string             `json:"model"`
-+	ModifiedAt time.Time          `json:"modified_at"`
-+	Size       int64              `json:"size"`
-+	Digest     string             `json:"digest"`
-+	Details    OllamaModelDetails `json:"details"`
-+}
-+
-+// OllamaModelDetails provides more details about a model.
-+type OllamaModelDetails struct {
-+	ParentModel       string   `json:"parent_model,omitempty"`
-+	Format            string   `json:"format,omitempty"`
-+	Family            string   `json:"family,omitempty"`
-+	Families          []string `json:"families,omitempty"`
-+	ParameterSize     string   `json:"parameter_size,omitempty"`
-+	QuantizationLevel string   `json:"quantization_level,omitempty"`
-+}
-+
-+type OllamaTensor struct {
-+	Name  string   `json:"name"`
-+	Type  string   `json:"type"`
-+	Shape []uint64 `json:"shape"`
-+}
-+
-+// OllamaShowRequest is the request for /api/show.
-+type OllamaShowRequest struct {
-+	Model string `json:"model,omitempty"`
-+	Name  string `json:"name,omitempty"`
-+}
-+
-+// OllamaShowResponse is the response from /api/show.
-+type OllamaShowResponse struct {
-+	License       string             `json:"license,omitempty"`
-+	Modelfile     string             `json:"modelfile,omitempty"`
-+	Parameters    string             `json:"parameters,omitempty"`
-+	Template      string             `json:"template,omitempty"`
-+	System        string             `json:"system,omitempty"`
-+	Details       OllamaModelDetails `json:"details,omitempty"`
-+	Messages      []OllamaMessage    `json:"messages,omitempty"`
-+	ModelInfo     map[string]any     `json:"model_info,omitempty"`
-+	ProjectorInfo map[string]any     `json:"projector_info,omitempty"`
-+	Tensors       []OllamaTensor     `json:"tensors,omitempty"`
-+	Capabilities  []string           `json:"capabilities,omitempty"`
-+	ModifiedAt    time.Time          `json:"modified_at,omitempty"`
-+}
-+
-+// OllamaProcessResponse is the response from /api/ps.
-+type OllamaProcessResponse struct {
-+	Models []OllamaProcessModelResponse `json:"models"`
-+}
-+
-+// OllamaProcessModelResponse describes a running model process.
-+type OllamaProcessModelResponse struct {
-+	Name      string             `json:"name"`
-+	Model     string             `json:"model"`
-+	Size      int64              `json:"size"`
-+	Digest    string             `json:"digest"`
-+	Details   OllamaModelDetails `json:"details"`
-+	ExpiresAt time.Time          `json:"expires_at"`
-+	SizeVRAM  int64              `json:"size_vram"`
-+}
-+
-+// OllamaEmbedRequest describes a request to /api/embed.
-+type OllamaEmbedRequest struct {
-+	Model     string                 `json:"model"`
-+	Input     interface{}            `json:"input"` // string or []string
-+	Truncate  *bool                  `json:"truncate,omitempty"`
-+	Options   map[string]interface{} `json:"options,omitempty"`
-+	KeepAlive interface{}            `json:"keep_alive,omitempty"`
-+}
-+
-+// OllamaEmbedResponse is the response from /api/embed.
-+type OllamaEmbedResponse struct {
-+	Model           string      `json:"model"`
-+	Embeddings      [][]float32 `json:"embeddings"`
-+	TotalDuration   int64       `json:"total_duration,omitempty"`
-+	LoadDuration    int64       `json:"load_duration,omitempty"`
-+	PromptEvalCount int         `json:"prompt_eval_count,omitempty"`
-+}
-+
-+// OllamaLegacyEmbeddingsRequest describes a request to /api/embeddings.
-+type OllamaLegacyEmbeddingsRequest struct {
-+	Model     string                 `json:"model"`
-+	Prompt    string                 `json:"prompt"`
-+	Options   map[string]interface{} `json:"options,omitempty"`
-+	KeepAlive interface{}            `json:"keep_alive,omitempty"`
-+}
-+
-+// OllamaLegacyEmbeddingsResponse is the response from /api/embeddings.
-+type OllamaLegacyEmbeddingsResponse struct {
-+	Embedding []float32 `json:"embedding"`
-+}
-+
-+// --- Helper types for transforming OpenAI stream to Ollama stream ---
-+
-+// OpenAIChatCompletionStreamChoiceDelta is part of an OpenAI stream event.
-+type OpenAIChatCompletionStreamChoiceDelta struct {
-+	Content          string                      `json:"content,omitempty"`
-+	ReasoningContent string                      `json:"reasoning_content,omitempty"` // For thinking/reasoning models
-+	Role             string                      `json:"role,omitempty"`
-+	ToolCalls        []OpenAIStreamToolCallDelta `json:"tool_calls,omitempty"`
-+}
-+
-+// OpenAIStreamToolCallDelta represents a tool call delta in a streaming response
-+type OpenAIStreamToolCallDelta struct {
-+	Index    int                          `json:"index"`
-+	ID       string                       `json:"id,omitempty"`
-+	Type     string                       `json:"type,omitempty"`
-+	Function OpenAIStreamToolCallFunction `json:"function,omitempty"`
-+}
-+
-+// OpenAIStreamToolCallFunction represents the function part of a streaming tool call
-+type OpenAIStreamToolCallFunction struct {
-+	Name      string `json:"name,omitempty"`
-+	Arguments string `json:"arguments,omitempty"`
-+}
-+
-+// OpenAIChatCompletionStreamChoice is part of an OpenAI stream event.
-+type OpenAIChatCompletionStreamChoice struct {
-+	Index        int                                   `json:"index"`
-+	Delta        OpenAIChatCompletionStreamChoiceDelta `json:"delta"`
-+	FinishReason string                                `json:"finish_reason,omitempty"`
-+}
-+
-+// OpenAIStreamingChatResponse is a typical OpenAI chat completion stream event.
-+type OpenAIStreamingChatResponse struct {
-+	ID      string                             `json:"id"`
-+	Object  string                             `json:"object"`
-+	Created int64                              `json:"created"`
-+	Model   string                             `json:"model"`
-+	Choices []OpenAIChatCompletionStreamChoice `json:"choices"`
-+	Usage   *OpenAIUsage                       `json:"usage,omitempty"`
-+}
-+
-+// OpenAICompletionStreamChoice is part of an OpenAI legacy completion stream event.
-+type OpenAICompletionStreamChoice struct {
-+	Text         string `json:"text"`
-+	Index        int    `json:"index"`
-+	FinishReason string `json:"finish_reason,omitempty"`
-+}
-+
-+// OpenAIStreamingCompletionResponse is a typical OpenAI legacy completion stream event.
-+type OpenAIStreamingCompletionResponse struct {
-+	ID      string                         `json:"id"`
-+	Object  string                         `json:"object"`
-+	Created int64                          `json:"created"`
-+	Model   string                         `json:"model"`
-+	Choices []OpenAICompletionStreamChoice `json:"choices"`
-+	Usage   *OpenAIUsage                   `json:"usage,omitempty"`
-+}
-+
-+// OpenAIUsage represents token usage statistics.
-+type OpenAIUsage struct {
++type openAIUsage struct {
 +	PromptTokens     int `json:"prompt_tokens"`
 +	CompletionTokens int `json:"completion_tokens"`
 +	TotalTokens      int `json:"total_tokens"`
 +}
 +
-+// OpenAIChatCompletionResponse is a non-streaming OpenAI chat response.
-+type OpenAIChatCompletionResponse struct {
-+	ID      string                               `json:"id"`
-+	Object  string                               `json:"object"`
-+	Created int64                                `json:"created"`
-+	Model   string                               `json:"model"`
-+	Choices []OpenAIChatCompletionResponseChoice `json:"choices"`
-+	Usage   OpenAIUsage                          `json:"usage"`
++type openAIStreamToolCallDelta struct {
++	Index    int                          `json:"index"`
++	ID       string                       `json:"id,omitempty"`
++	Type     string                       `json:"type,omitempty"`
++	Function openAIStreamToolCallFunction `json:"function,omitempty"`
 +}
 +
-+// OpenAIChatCompletionMessage is the message structure in a non-streaming OpenAI response.
-+type OpenAIChatCompletionMessage struct {
-+	Role             string           `json:"role"`
-+	Content          string           `json:"content"`
-+	ReasoningContent string           `json:"reasoning_content,omitempty"` // For thinking/reasoning models
-+	ToolCalls        []OpenAIToolCall `json:"tool_calls,omitempty"`
++type openAIStreamToolCallFunction struct {
++	Name      string `json:"name,omitempty"`
++	Arguments string `json:"arguments,omitempty"`
 +}
 +
-+// OpenAIToolCall represents a tool call in OpenAI format
-+type OpenAIToolCall struct {
-+	ID       string                 `json:"id"`
-+	Type     string                 `json:"type"`
-+	Function OpenAIToolCallFunction `json:"function"`
++type openAIChatStreamResponse struct {
++	Choices []struct {
++		Delta struct {
++			Role             string                      `json:"role,omitempty"`
++			Content          string                      `json:"content,omitempty"`
++			ReasoningContent string                      `json:"reasoning_content,omitempty"`
++			ToolCalls        []openAIStreamToolCallDelta `json:"tool_calls,omitempty"`
++		} `json:"delta"`
++		FinishReason string `json:"finish_reason,omitempty"`
++	} `json:"choices"`
++	Usage *openAIUsage `json:"usage,omitempty"`
 +}
 +
-+// OpenAIToolCallFunction represents the function part of a tool call
-+type OpenAIToolCallFunction struct {
++type openAICompletionStreamResponse struct {
++	Choices []struct {
++		Text         string `json:"text"`
++		FinishReason string `json:"finish_reason,omitempty"`
++	} `json:"choices"`
++	Usage *openAIUsage `json:"usage,omitempty"`
++}
++
++type openAIChatResponse struct {
++	Choices []struct {
++		Message struct {
++			Role             string           `json:"role"`
++			Content          string           `json:"content"`
++			ReasoningContent string           `json:"reasoning_content,omitempty"`
++			ToolCalls        []openAIToolCall `json:"tool_calls,omitempty"`
++		} `json:"message"`
++		FinishReason string `json:"finish_reason"`
++	} `json:"choices"`
++	Usage openAIUsage `json:"usage"`
++}
++
++type openAIToolCall struct {
++	ID       string             `json:"id"`
++	Type     string             `json:"type"`
++	Function openAIToolCallFunc `json:"function"`
++}
++
++type openAIToolCallFunc struct {
 +	Name      string `json:"name"`
 +	Arguments string `json:"arguments"`
 +}
 +
-+// OpenAIChatCompletionResponseChoice is part of a non-streaming OpenAI chat response.
-+type OpenAIChatCompletionResponseChoice struct {
-+	Index        int                         `json:"index"`
-+	Message      OpenAIChatCompletionMessage `json:"message"`
-+	FinishReason string                      `json:"finish_reason"`
++type openAICompletionResponse struct {
++	Choices []struct {
++		Text         string `json:"text"`
++		FinishReason string `json:"finish_reason"`
++	} `json:"choices"`
++	Usage openAIUsage `json:"usage"`
 +}
 +
-+// OpenAICompletionResponse is a non-streaming OpenAI legacy completion response.
-+type OpenAICompletionResponse struct {
-+	ID      string                         `json:"id"`
-+	Object  string                         `json:"object"`
-+	Created int64                          `json:"created"`
-+	Model   string                         `json:"model"`
-+	Choices []OpenAICompletionStreamChoice `json:"choices"`
-+	Usage   OpenAIUsage                    `json:"usage"`
++type openAIEmbeddingResponse struct {
++	Data []struct {
++		Embedding []float64 `json:"embedding"`
++	} `json:"data"`
++	Usage openAIUsage `json:"usage"`
++}
++
++func writeOllamaJSON(w http.ResponseWriter, status int, v any) {
++	w.Header().Set("Content-Type", "application/json")
++	w.WriteHeader(status)
++	_ = json.NewEncoder(w).Encode(v)
++}
++
++func writeOllamaError(w http.ResponseWriter, status int, message string) {
++	writeOllamaJSON(w, status, ollamaErrorResponse{Error: message})
++}
++
++func handleOllamaHeartbeat(w http.ResponseWriter, r *http.Request) {
++	if r.Method == http.MethodGet {
++		w.Header().Set("Content-Type", "text/plain")
++		_, _ = w.Write([]byte("Ollama is running"))
++		return
++	}
++	w.WriteHeader(http.StatusOK)
++}
++
++func (s *Server) handleOllamaVersion(w http.ResponseWriter, r *http.Request) {
++	setOllamaCORS(w, r)
++	writeOllamaJSON(w, http.StatusOK, ollamaVersionResponse{Version: "0.13.5"})
++}
++
++func (s *Server) handleOllamaTags(w http.ResponseWriter, r *http.Request) {
++	ids := make([]string, 0, len(s.cfg.Models))
++	for id, modelCfg := range s.cfg.Models {
++		if !modelCfg.Unlisted {
++			ids = append(ids, id)
++		}
++	}
++	sort.Strings(ids)
++
++	now := time.Now().UTC()
++	models := make([]ollamaModelResponse, 0, len(ids))
++	for _, id := range ids {
++		modelCfg := s.cfg.Models[id]
++		models = append(models, ollamaModelResponse{
++			Name:         id,
++			Model:        id,
++			ModifiedAt:   now,
++			Size:         0,
++			Digest:       digestForModel(id),
++			Details:      ollamaDetailsForModel(id, modelCfg),
++			Capabilities: ollamaCapabilitiesForModel(modelCfg),
++		})
++	}
++
++	setOllamaCORS(w, r)
++	writeOllamaJSON(w, http.StatusOK, map[string]any{"models": models})
++}
++
++func (s *Server) handleOllamaShow(w http.ResponseWriter, r *http.Request) {
++	var req ollamaShowRequest
++	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
++		writeOllamaError(w, http.StatusBadRequest, fmt.Sprintf("Invalid request: %v", err))
++		return
++	}
++	modelName := firstNonEmpty(req.Model, req.Name)
++	if modelName == "" {
++		writeOllamaError(w, http.StatusBadRequest, "Model name is required.")
++		return
++	}
++
++	modelCfg, realName, ok := s.cfg.FindConfig(modelName)
++	if !ok {
++		writeOllamaError(w, http.StatusNotFound, fmt.Sprintf("Model '%s' not found.", modelName))
++		return
++	}
++
++	parsed := NewLlamaServerParser().Parse(modelCfg.Cmd, realName)
++	metadata := modelCfg.Metadata
++	arch := metadataString(metadata, "architecture", parsed.Architecture)
++	details := ollamaDetailsForModel(realName, modelCfg)
++	if details.Family == "" {
++		details.Family = parsed.Family
++	}
++	if details.ParameterSize == "" {
++		details.ParameterSize = parsed.ParameterSize
++	}
++	if details.QuantizationLevel == "" {
++		details.QuantizationLevel = parsed.QuantizationLevel
++	}
++	if details.ContextLength == 0 {
++		details.ContextLength = metadataInt(metadata, "contextLength", parsed.ContextLength)
++	}
++
++	modelInfo := map[string]any{"general.architecture": arch}
++	ctxLength := details.ContextLength
++	if ctxLength == 0 {
++		ctxLength = 2048
++	}
++	modelInfo[fmt.Sprintf("%s.context_length", arch)] = ctxLength
++
++	setOllamaCORS(w, r)
++	writeOllamaJSON(w, http.StatusOK, ollamaShowResponse{
++		Modelfile:    modelCfg.Cmd,
++		Details:      details,
++		ModelInfo:    modelInfo,
++		Capabilities: ollamaCapabilitiesForModel(modelCfg),
++		ModifiedAt:   time.Now().UTC(),
++	})
++}
++
++func (s *Server) handleOllamaPS(w http.ResponseWriter, r *http.Request) {
++	running := s.local.RunningModels()
++	ids := make([]string, 0, len(running))
++	for id := range running {
++		ids = append(ids, id)
++	}
++	sort.Strings(ids)
++
++	now := time.Now().UTC()
++	models := make([]ollamaProcessModelResponse, 0, len(ids))
++	for _, id := range ids {
++		cfg := s.cfg.Models[id]
++		expiresAt := time.Time{}
++		if cfg.UnloadAfter > 0 {
++			expiresAt = now.Add(time.Duration(cfg.UnloadAfter) * time.Second)
++		}
++		models = append(models, ollamaProcessModelResponse{
++			Name:      id,
++			Model:     id,
++			Size:      0,
++			Digest:    digestForModel(id),
++			Details:   ollamaDetailsForModel(id, cfg),
++			ExpiresAt: expiresAt,
++			SizeVRAM:  0,
++		})
++	}
++
++	setOllamaCORS(w, r)
++	writeOllamaJSON(w, http.StatusOK, ollamaProcessResponse{Models: models})
++}
++
++func (s *Server) handleOllamaChat(w http.ResponseWriter, r *http.Request) {
++	var req ollamaChatRequest
++	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
++		writeOllamaError(w, http.StatusBadRequest, fmt.Sprintf("Invalid request: %v", err))
++		return
++	}
++	if err := validateOllamaToolRequest(&req); err != nil {
++		writeOllamaError(w, http.StatusBadRequest, err.Error())
++		return
++	}
++	if req.Model == "" {
++		writeOllamaError(w, http.StatusBadRequest, "Model name is required.")
++		return
++	}
++
++	realModel, upstreamModel, ok := s.resolveOllamaModel(req.Model)
++	if !ok {
++		writeOllamaError(w, http.StatusNotFound, "model not found")
++		return
++	}
++
++	stream := true
++	if req.Stream != nil {
++		stream = *req.Stream
++	}
++	body := map[string]any{
++		"model":    upstreamModel,
++		"messages": ollamaMessagesToOpenAI(req.Messages),
++		"stream":   stream,
++	}
++	mergeOptions(body, req.Options)
++	if tools := ollamaToolsToOpenAI(req.Tools); len(tools) > 0 {
++		body["tools"] = tools
++	}
++	if req.ToolChoice != nil {
++		body["tool_choice"] = req.ToolChoice
++	}
++	applyOllamaFormat(body, req.Format)
++	applyOllamaThink(body, req.Think)
++	applyChatTemplateKwargs(body, s.cfg.Models[realModel].ChatTemplateKwargs)
++
++	if stream {
++		w.Header().Set("Content-Type", "application/x-ndjson")
++		s.streamOllama(w, r, req.Model, realModel, "/v1/chat/completions", body, true)
++		return
++	}
++
++	rr, ok := s.dispatchOllama(w, r, req.Model, realModel, "/v1/chat/completions", body, false)
++	if !ok {
++		return
++	}
++	var resp openAIChatResponse
++	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil || len(resp.Choices) == 0 {
++		copyUpstreamResponse(w, rr)
++		return
++	}
++	choice := resp.Choices[0]
++	writeOllamaJSON(w, http.StatusOK, ollamaChatResponse{
++		Model:     req.Model,
++		CreatedAt: time.Now().UTC(),
++		Message: ollamaMessage{
++			Role:      defaultString(openAIRoleToOllama(choice.Message.Role), "assistant"),
++			Content:   choice.Message.Content,
++			Thinking:  choice.Message.ReasoningContent,
++			ToolCalls: openAIToolCallsToOllama(choice.Message.ToolCalls),
++		},
++		Done:            true,
++		DoneReason:      openAIFinishReasonToOllama(choice.FinishReason),
++		PromptEvalCount: resp.Usage.PromptTokens,
++		EvalCount:       resp.Usage.CompletionTokens,
++	})
++}
++
++func (s *Server) handleOllamaGenerate(w http.ResponseWriter, r *http.Request) {
++	var req ollamaGenerateRequest
++	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
++		writeOllamaError(w, http.StatusBadRequest, fmt.Sprintf("Invalid request: %v", err))
++		return
++	}
++	if req.Model == "" {
++		writeOllamaError(w, http.StatusBadRequest, "Model name is required.")
++		return
++	}
++
++	realModel, upstreamModel, ok := s.resolveOllamaModel(req.Model)
++	if !ok {
++		writeOllamaError(w, http.StatusNotFound, "model not found")
++		return
++	}
++
++	stream := true
++	if req.Stream != nil {
++		stream = *req.Stream
++	}
++	body := map[string]any{
++		"model":  upstreamModel,
++		"prompt": req.Prompt,
++		"stream": stream,
++	}
++	mergeOptions(body, req.Options)
++	copyIfNotZero(body, "suffix", req.Suffix)
++	copyIfNotZero(body, "system", req.System)
++	copyIfNotZero(body, "template", req.Template)
++	copyIfNotZero(body, "raw", req.Raw)
++	copyIfNotZero(body, "images", req.Images)
++	applyOllamaFormat(body, req.Format)
++	applyOllamaThink(body, req.Think)
++	applyChatTemplateKwargs(body, s.cfg.Models[realModel].ChatTemplateKwargs)
++
++	if stream {
++		w.Header().Set("Content-Type", "application/x-ndjson")
++		s.streamOllama(w, r, req.Model, realModel, "/v1/completions", body, false)
++		return
++	}
++
++	rr, ok := s.dispatchOllama(w, r, req.Model, realModel, "/v1/completions", body, false)
++	if !ok {
++		return
++	}
++	var resp openAICompletionResponse
++	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil || len(resp.Choices) == 0 {
++		copyUpstreamResponse(w, rr)
++		return
++	}
++	choice := resp.Choices[0]
++	writeOllamaJSON(w, http.StatusOK, ollamaGenerateResponse{
++		Model:           req.Model,
++		CreatedAt:       time.Now().UTC(),
++		Response:        choice.Text,
++		Done:            true,
++		DoneReason:      openAIFinishReasonToOllama(choice.FinishReason),
++		PromptEvalCount: resp.Usage.PromptTokens,
++		EvalCount:       resp.Usage.CompletionTokens,
++	})
++}
++
++func (s *Server) handleOllamaEmbed(w http.ResponseWriter, r *http.Request) {
++	var req ollamaEmbedRequest
++	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
++		writeOllamaError(w, http.StatusBadRequest, fmt.Sprintf("Invalid request: %v", err))
++		return
++	}
++	if req.Model == "" {
++		writeOllamaError(w, http.StatusBadRequest, "Model name is required.")
++		return
++	}
++	realModel, upstreamModel, ok := s.resolveOllamaModel(req.Model)
++	if !ok {
++		writeOllamaError(w, http.StatusNotFound, "model not found")
++		return
++	}
++
++	rr, ok := s.dispatchOllama(w, r, req.Model, realModel, "/v1/embeddings", map[string]any{"model": upstreamModel, "input": req.Input}, false)
++	if !ok {
++		return
++	}
++	var resp openAIEmbeddingResponse
++	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
++		copyUpstreamResponse(w, rr)
++		return
++	}
++	embeddings := make([][]float64, 0, len(resp.Data))
++	for _, item := range resp.Data {
++		embeddings = append(embeddings, item.Embedding)
++	}
++	writeOllamaJSON(w, http.StatusOK, map[string]any{
++		"model":             req.Model,
++		"embeddings":        embeddings,
++		"prompt_eval_count": resp.Usage.PromptTokens,
++	})
++}
++
++func (s *Server) handleOllamaEmbeddings(w http.ResponseWriter, r *http.Request) {
++	var req ollamaLegacyEmbeddingsRequest
++	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
++		writeOllamaError(w, http.StatusBadRequest, fmt.Sprintf("Invalid request: %v", err))
++		return
++	}
++	if req.Model == "" {
++		writeOllamaError(w, http.StatusBadRequest, "Model name is required.")
++		return
++	}
++	realModel, upstreamModel, ok := s.resolveOllamaModel(req.Model)
++	if !ok {
++		writeOllamaError(w, http.StatusNotFound, "model not found")
++		return
++	}
++
++	rr, ok := s.dispatchOllama(w, r, req.Model, realModel, "/v1/embeddings", map[string]any{"model": upstreamModel, "input": req.Prompt}, false)
++	if !ok {
++		return
++	}
++	var resp openAIEmbeddingResponse
++	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil || len(resp.Data) == 0 {
++		copyUpstreamResponse(w, rr)
++		return
++	}
++	writeOllamaJSON(w, http.StatusOK, map[string]any{"embedding": resp.Data[0].Embedding})
++}
++
++func handleOllamaNotImplemented(w http.ResponseWriter, r *http.Request) {
++	writeOllamaError(w, http.StatusNotImplemented, "This Ollama API endpoint is not implemented in llama-swap.")
++}
++
++func (s *Server) resolveOllamaModel(requested string) (realModel string, upstreamModel string, ok bool) {
++	realModel, ok = s.cfg.RealModelName(requested)
++	if !ok {
++		realModel = requested
++	}
++	cfg, exists := s.cfg.Models[realModel]
++	if !exists && !s.peer.Handles(realModel) {
++		return realModel, requested, false
++	}
++	upstreamModel = realModel
++	if cfg.UseModelName != "" {
++		upstreamModel = cfg.UseModelName
++	}
++	return realModel, upstreamModel, true
++}
++
++func (s *Server) dispatchOllama(w http.ResponseWriter, parent *http.Request, requestedModel string, realModel string, path string, body map[string]any, streaming bool) (*httptest.ResponseRecorder, bool) {
++	req, err := newOllamaUpstreamRequest(parent, requestedModel, realModel, path, body, streaming)
++	if err != nil {
++		writeOllamaError(w, http.StatusInternalServerError, err.Error())
++		return nil, false
++	}
++	rr := httptest.NewRecorder()
++	if !s.serveOllamaUpstream(rr, req, realModel) {
++		writeOllamaError(w, http.StatusNotFound, "model not found")
++		return nil, false
++	}
++	if rr.Code >= 400 {
++		copyUpstreamResponse(w, rr)
++		return nil, false
++	}
++	return rr, true
++}
++
++func (s *Server) streamOllama(w http.ResponseWriter, parent *http.Request, requestedModel string, realModel string, path string, body map[string]any, isChat bool) {
++	req, err := newOllamaUpstreamRequest(parent, requestedModel, realModel, path, body, true)
++	if err != nil {
++		writeOllamaError(w, http.StatusInternalServerError, err.Error())
++		return
++	}
++	trw := newOllamaStreamWriter(w, requestedModel, isChat)
++	if !s.serveOllamaUpstream(trw, req, realModel) {
++		writeOllamaError(w, http.StatusNotFound, "model not found")
++		return
++	}
++	trw.Flush()
++}
++
++func newOllamaUpstreamRequest(parent *http.Request, requestedModel string, realModel string, path string, body map[string]any, streaming bool) (*http.Request, error) {
++	payload, err := json.Marshal(body)
++	if err != nil {
++		return nil, fmt.Errorf("failed to marshal upstream request")
++	}
++	req, err := http.NewRequestWithContext(parent.Context(), http.MethodPost, path, bytes.NewReader(payload))
++	if err != nil {
++		return nil, fmt.Errorf("failed to create upstream request")
++	}
++	req.Header = parent.Header.Clone()
++	req.Header.Set("Content-Type", "application/json")
++	req.Header.Set("Accept", "application/json")
++	req.ContentLength = int64(len(payload))
++	req = req.WithContext(shared.SetContext(req.Context(), shared.ReqContextData{
++		ApiKey:           shared.ExtractAPIKey(parent),
++		Model:            requestedModel,
++		ModelID:          realModel,
++		Streaming:        streaming,
++		SendLoadingState: false,
++		Metadata:         map[string]string{},
++	}))
++	return req, nil
++}
++
++func (s *Server) serveOllamaUpstream(w http.ResponseWriter, req *http.Request, realModel string) bool {
++	switch {
++	case s.local.Handles(realModel):
++		s.local.ServeHTTP(w, req)
++	case s.peer.Handles(realModel):
++		s.peer.ServeHTTP(w, req)
++	default:
++		return false
++	}
++	return true
++}
++
++type accumulatedToolCall struct {
++	ID        string
++	Type      string
++	Name      string
++	Arguments strings.Builder
++}
++
++type ollamaStreamWriter struct {
++	dst            http.ResponseWriter
++	model          string
++	isChat         bool
++	buffer         bytes.Buffer
++	toolCallBuffer map[int]*accumulatedToolCall
++	rawPassthrough bool
++	wroteHeader    bool
++}
++
++func newOllamaStreamWriter(dst http.ResponseWriter, model string, isChat bool) *ollamaStreamWriter {
++	return &ollamaStreamWriter{
++		dst:            dst,
++		model:          model,
++		isChat:         isChat,
++		toolCallBuffer: make(map[int]*accumulatedToolCall),
++	}
++}
++
++func (w *ollamaStreamWriter) Header() http.Header {
++	return w.dst.Header()
++}
++
++func (w *ollamaStreamWriter) WriteHeader(statusCode int) {
++	if w.wroteHeader {
++		return
++	}
++	w.wroteHeader = true
++	if statusCode >= 400 {
++		w.rawPassthrough = true
++		w.dst.WriteHeader(statusCode)
++		return
++	}
++	w.dst.Header().Set("Content-Type", "application/x-ndjson")
++	w.dst.WriteHeader(statusCode)
++}
++
++func (w *ollamaStreamWriter) Write(data []byte) (int, error) {
++	if w.rawPassthrough {
++		_, err := w.dst.Write(data)
++		return len(data), err
++	}
++	w.buffer.Write(data)
++	w.Flush()
++	return len(data), nil
++}
++
++func (w *ollamaStreamWriter) Flush() {
++	if w.rawPassthrough {
++		if flusher, ok := w.dst.(http.Flusher); ok {
++			flusher.Flush()
++		}
++		return
++	}
++
++	var remaining bytes.Buffer
++	scanner := bufio.NewScanner(bytes.NewReader(w.buffer.Bytes()))
++	for scanner.Scan() {
++		line := scanner.Text()
++		if strings.HasPrefix(line, "data: ") {
++			w.transformSSE(strings.TrimPrefix(line, "data: "))
++		} else if strings.TrimSpace(line) != "" {
++			_, _ = w.dst.Write([]byte(line + "\n"))
++		}
++	}
++	if len(w.buffer.Bytes()) > 0 && !bytes.HasSuffix(w.buffer.Bytes(), []byte("\n")) {
++		last := w.buffer.Bytes()
++		if idx := bytes.LastIndexByte(last, '\n'); idx >= 0 {
++			remaining.Write(last[idx+1:])
++		} else {
++			remaining.Write(last)
++		}
++	}
++	w.buffer = remaining
++
++	if flusher, ok := w.dst.(http.Flusher); ok {
++		flusher.Flush()
++	}
++}
++
++func (w *ollamaStreamWriter) transformSSE(data string) {
++	if data == "[DONE]" || strings.TrimSpace(data) == "" {
++		return
++	}
++	if w.isChat {
++		w.transformChatChunk(data)
++		return
++	}
++	w.transformGenerateChunk(data)
++}
++
++func (w *ollamaStreamWriter) transformChatChunk(data string) {
++	var chunk openAIChatStreamResponse
++	if err := json.Unmarshal([]byte(data), &chunk); err != nil || len(chunk.Choices) == 0 {
++		return
++	}
++	choice := chunk.Choices[0]
++	message := ollamaMessage{
++		Role:     openAIRoleToOllama(choice.Delta.Role),
++		Content:  choice.Delta.Content,
++		Thinking: choice.Delta.ReasoningContent,
++	}
++	for _, delta := range choice.Delta.ToolCalls {
++		acc := w.toolCallBuffer[delta.Index]
++		if acc == nil {
++			acc = &accumulatedToolCall{}
++			w.toolCallBuffer[delta.Index] = acc
++		}
++		if delta.ID != "" {
++			acc.ID = delta.ID
++		}
++		if delta.Type != "" {
++			acc.Type = delta.Type
++		}
++		if delta.Function.Name != "" {
++			acc.Name = delta.Function.Name
++		}
++		acc.Arguments.WriteString(delta.Function.Arguments)
++	}
++
++	if choice.FinishReason != "" && len(w.toolCallBuffer) > 0 {
++		toolCalls := w.accumulatedOllamaToolCalls()
++		if len(toolCalls) > 0 {
++			message.ToolCalls = toolCalls
++			w.writeNDJSON(ollamaChatResponse{
++				Model:      w.model,
++				CreatedAt:  time.Now().UTC(),
++				Message:    messageWithDefaultRole(message),
++				Done:       false,
++				DoneReason: openAIFinishReasonToOllama(choice.FinishReason),
++			})
++		}
++		w.writeNDJSON(ollamaChatResponse{
++			Model:           w.model,
++			CreatedAt:       time.Now().UTC(),
++			Message:         ollamaMessage{Role: "assistant"},
++			Done:            true,
++			DoneReason:      openAIFinishReasonToOllama(choice.FinishReason),
++			PromptEvalCount: usagePromptTokens(chunk.Usage),
++			EvalCount:       usageCompletionTokens(chunk.Usage),
++		})
++		return
++	}
++
++	w.writeNDJSON(ollamaChatResponse{
++		Model:           w.model,
++		CreatedAt:       time.Now().UTC(),
++		Message:         messageWithDefaultRole(message),
++		Done:            choice.FinishReason != "",
++		DoneReason:      openAIFinishReasonToOllama(choice.FinishReason),
++		PromptEvalCount: usagePromptTokens(chunk.Usage),
++		EvalCount:       usageCompletionTokens(chunk.Usage),
++	})
++}
++
++func (w *ollamaStreamWriter) transformGenerateChunk(data string) {
++	var chunk openAICompletionStreamResponse
++	if err := json.Unmarshal([]byte(data), &chunk); err != nil || len(chunk.Choices) == 0 {
++		return
++	}
++	choice := chunk.Choices[0]
++	w.writeNDJSON(ollamaGenerateResponse{
++		Model:           w.model,
++		CreatedAt:       time.Now().UTC(),
++		Response:        choice.Text,
++		Done:            choice.FinishReason != "",
++		DoneReason:      openAIFinishReasonToOllama(choice.FinishReason),
++		PromptEvalCount: usagePromptTokens(chunk.Usage),
++		EvalCount:       usageCompletionTokens(chunk.Usage),
++	})
++}
++
++func (w *ollamaStreamWriter) accumulatedOllamaToolCalls() []ollamaToolCall {
++	indices := make([]int, 0, len(w.toolCallBuffer))
++	for idx := range w.toolCallBuffer {
++		indices = append(indices, idx)
++	}
++	sort.Ints(indices)
++
++	calls := make([]ollamaToolCall, 0, len(indices))
++	for _, idx := range indices {
++		acc := w.toolCallBuffer[idx]
++		if acc == nil || acc.Name == "" {
++			continue
++		}
++		args := map[string]any{}
++		if raw := acc.Arguments.String(); raw != "" {
++			_ = json.Unmarshal([]byte(raw), &args)
++		}
++		calls = append(calls, ollamaToolCall{
++			ID:   acc.ID,
++			Type: defaultString(acc.Type, "function"),
++			Function: ollamaToolCallFunc{
++				Index:     idx,
++				Name:      acc.Name,
++				Arguments: args,
++			},
++		})
++	}
++	return calls
++}
++
++func (w *ollamaStreamWriter) writeNDJSON(v any) {
++	b, err := json.Marshal(v)
++	if err != nil {
++		return
++	}
++	_, _ = w.dst.Write(append(b, '\n'))
++}
++
++func mergeOptions(dst map[string]any, options map[string]any) {
++	for k, v := range options {
++		if _, exists := dst[k]; !exists {
++			dst[k] = v
++		}
++	}
++}
++
++func applyOllamaFormat(dst map[string]any, format any) {
++	switch f := format.(type) {
++	case nil:
++	case string:
++		if f == "json" {
++			dst["response_format"] = map[string]any{"type": "json_object"}
++		}
++	case map[string]any:
++		dst["response_format"] = map[string]any{"type": "json_schema", "schema": f}
++	}
++}
++
++func applyOllamaThink(dst map[string]any, think any) {
++	if think == nil {
++		return
++	}
++	kwargs, _ := dst["chat_template_kwargs"].(map[string]any)
++	if kwargs == nil {
++		kwargs = map[string]any{}
++		dst["chat_template_kwargs"] = kwargs
++	}
++	switch v := think.(type) {
++	case bool:
++		kwargs["enable_thinking"] = v
++	case string:
++		kwargs["enable_thinking"] = v == "high" || v == "medium" || v == "low" || v == "max"
++		kwargs["thinking_level"] = v
++	}
++}
++
++func applyChatTemplateKwargs(dst map[string]any, defaults map[string]any) {
++	if len(defaults) == 0 {
++		return
++	}
++	kwargs, _ := dst["chat_template_kwargs"].(map[string]any)
++	if kwargs == nil {
++		kwargs = map[string]any{}
++		dst["chat_template_kwargs"] = kwargs
++	}
++	for k, v := range defaults {
++		if _, exists := kwargs[k]; !exists {
++			kwargs[k] = v
++		}
++	}
++}
++
++func copyIfNotZero(dst map[string]any, key string, value any) {
++	switch v := value.(type) {
++	case string:
++		if v != "" {
++			dst[key] = v
++		}
++	case bool:
++		if v {
++			dst[key] = v
++		}
++	case []string:
++		if len(v) > 0 {
++			dst[key] = v
++		}
++	default:
++		if v != nil {
++			dst[key] = v
++		}
++	}
++}
++
++func copyUpstreamResponse(w http.ResponseWriter, rr *httptest.ResponseRecorder) {
++	copyHeader(w.Header(), rr.Header())
++	w.WriteHeader(rr.Code)
++	_, _ = io.Copy(w, rr.Body)
++}
++
++func copyHeader(dst, src http.Header) {
++	for k, values := range src {
++		for _, v := range values {
++			dst.Add(k, v)
++		}
++	}
++}
++
++func setOllamaCORS(w http.ResponseWriter, r *http.Request) {
++	if origin := r.Header.Get("Origin"); origin != "" {
++		w.Header().Set("Access-Control-Allow-Origin", origin)
++	}
++}
++
++func defaultString(value, fallback string) string {
++	if strings.TrimSpace(value) == "" {
++		return fallback
++	}
++	return value
++}
++
++func firstNonEmpty(values ...string) string {
++	for _, v := range values {
++		if strings.TrimSpace(v) != "" {
++			return v
++		}
++	}
++	return ""
++}
++
++func messageWithDefaultRole(message ollamaMessage) ollamaMessage {
++	if message.Role == "" {
++		message.Role = "assistant"
++	}
++	return message
++}
++
++func usagePromptTokens(usage *openAIUsage) int {
++	if usage == nil {
++		return 0
++	}
++	return usage.PromptTokens
++}
++
++func usageCompletionTokens(usage *openAIUsage) int {
++	if usage == nil {
++		return 0
++	}
++	return usage.CompletionTokens
 +}
 +
 +func openAIFinishReasonToOllama(reason string) string {
 +	switch reason {
-+	case "stop":
-+		return "stop"
-+	case "length":
-+		return "length"
-+	case "content_filter":
-+		return "content_filter"
-+	case "tool_calls":
-+		return "tool_calls"
++	case "", "stop", "length", "content_filter", "tool_calls":
++		return reason
 +	default:
-+		if reason != "" {
-+			return "unknown"
-+		}
-+		return ""
++		return "unknown"
 +	}
 +}
 +
 +func openAIRoleToOllama(role string) string {
 +	switch role {
-+	case "system":
-+		return "system"
-+	case "user":
-+		return "user"
-+	case "assistant":
-+		return "assistant"
++	case "system", "user", "assistant", "tool":
++		return role
 +	default:
 +		return role
 +	}
 +}
 +
-+func ollamaMessagesToOpenAI(ollamaMsgs []OllamaMessage) []map[string]interface{} {
-+	openAIMsgs := make([]map[string]interface{}, len(ollamaMsgs))
++func ollamaMessagesToOpenAI(ollamaMsgs []ollamaMessage) []map[string]any {
++	openAIMsgs := make([]map[string]any, 0, len(ollamaMsgs))
 +	for i, msg := range ollamaMsgs {
-+		openAIMsg := map[string]interface{}{
++		openAIMsg := map[string]any{
 +			"role":    msg.Role,
 +			"content": msg.Content,
 +		}
-+
-+		// Handle tool calls from assistant
-+		// Filter out invalid tool calls (empty function names) which can occur
-+		// when models hallucinate extra tool calls
++		if len(msg.Images) > 0 {
++			openAIMsg["images"] = msg.Images
++		}
 +		if len(msg.ToolCalls) > 0 {
-+			openAIToolCalls := make([]map[string]interface{}, 0, len(msg.ToolCalls))
-+			validIndex := 0
-+			for _, tc := range msg.ToolCalls {
-+				// Skip invalid tool calls with empty function names
++			calls := make([]map[string]any, 0, len(msg.ToolCalls))
++			for j, tc := range msg.ToolCalls {
 +				if tc.Function.Name == "" {
 +					continue
 +				}
-+
 +				argsJSON, _ := json.Marshal(tc.Function.Arguments)
-+
-+				// Generate ID if missing (for compatibility with clients like Zed)
 +				toolID := tc.ID
 +				if toolID == "" {
-+					toolID = fmt.Sprintf("call_%d_%d", i, validIndex)
++					toolID = fmt.Sprintf("call_%d_%d", i, j)
 +				}
-+
-+				// Default type to "function" if not provided
-+				toolType := tc.Type
-+				if toolType == "" {
-+					toolType = "function"
-+				}
-+
-+				openAIToolCalls = append(openAIToolCalls, map[string]interface{}{
++				calls = append(calls, map[string]any{
 +					"id":   toolID,
-+					"type": toolType,
-+					"function": map[string]interface{}{
++					"type": defaultString(tc.Type, "function"),
++					"function": map[string]any{
 +						"name":      tc.Function.Name,
 +						"arguments": string(argsJSON),
 +					},
 +				})
-+				validIndex++
 +			}
-+			if len(openAIToolCalls) > 0 {
-+				openAIMsg["tool_calls"] = openAIToolCalls
++			if len(calls) > 0 {
++				openAIMsg["tool_calls"] = calls
 +			}
 +		}
-+
-+		// Handle tool role messages
-+		// Support both OpenAI style (tool_call_id) and Ollama native style (tool_name)
 +		if msg.Role == "tool" {
-+			if msg.ToolCallID != "" {
++			switch {
++			case msg.ToolCallID != "":
 +				openAIMsg["tool_call_id"] = msg.ToolCallID
-+			} else if msg.ToolName != "" {
-+				// Ollama native format uses tool_name instead of tool_call_id
-+				// Generate a synthetic ID based on the tool name for OpenAI compatibility
++			case msg.ToolName != "":
 +				openAIMsg["tool_call_id"] = fmt.Sprintf("call_%s_%d", msg.ToolName, i)
 +			}
 +			if msg.Content == "" {
 +				openAIMsg["content"] = "null"
 +			}
 +		}
-+
-+		openAIMsgs[i] = openAIMsg
++		openAIMsgs = append(openAIMsgs, openAIMsg)
 +	}
 +	return openAIMsgs
 +}
 +
-+func ollamaToolsToOpenAI(ollamaTools []OllamaTool) []map[string]interface{} {
-+	if len(ollamaTools) == 0 {
++func ollamaToolsToOpenAI(tools []ollamaTool) []map[string]any {
++	if len(tools) == 0 {
 +		return nil
 +	}
-+
-+	openAITools := make([]map[string]interface{}, len(ollamaTools))
-+	for i, tool := range ollamaTools {
-+		openAITools[i] = map[string]interface{}{
-+			"type": tool.Type,
-+			"function": map[string]interface{}{
++	openAITools := make([]map[string]any, 0, len(tools))
++	for _, tool := range tools {
++		openAITools = append(openAITools, map[string]any{
++			"type": defaultString(tool.Type, "function"),
++			"function": map[string]any{
 +				"name":        tool.Function.Name,
 +				"description": tool.Function.Description,
-+				"parameters":  tool.Function.Parameters, // Pass as object, not JSON string
++				"parameters":  tool.Function.Parameters,
 +			},
-+		}
++		})
 +	}
 +	return openAITools
 +}
 +
-+// createOpenAIRequestBodyOptions holds optional parameters for createOpenAIRequestBody
-+type createOpenAIRequestBodyOptions struct {
-+	Think  *bool       // Ollama think parameter -> chat_template_kwargs.enable_thinking
-+	Format interface{} // Ollama format parameter (string "json" or JSON Schema object)
-+}
-+
-+func createOpenAIRequestBody(modelName string, messages []map[string]interface{}, stream bool, options map[string]interface{}, tools []map[string]interface{}, toolChoice interface{}, opts *createOpenAIRequestBodyOptions) ([]byte, error) {
-+	requestBody := map[string]interface{}{
-+		"model":    modelName,
-+		"messages": messages,
-+		"stream":   stream,
-+	}
-+
-+	if tools != nil {
-+		requestBody["tools"] = tools
-+	}
-+
-+	if toolChoice != nil {
-+		requestBody["tool_choice"] = toolChoice
-+	}
-+
-+	if options != nil {
-+		for k, v := range options {
-+			if _, exists := requestBody[k]; !exists {
-+				requestBody[k] = v
-+			}
-+		}
-+	}
-+
-+	// Handle Ollama-specific options
-+	if opts != nil {
-+		// Translate Ollama's think parameter to llama-server's chat_template_kwargs
-+		if opts.Think != nil {
-+			requestBody["chat_template_kwargs"] = map[string]interface{}{
-+				"enable_thinking": *opts.Think,
-+			}
-+		}
-+
-+		// Handle format parameter
-+		if opts.Format != nil {
-+			switch f := opts.Format.(type) {
-+			case string:
-+				// Simple "json" format
-+				if f == "json" {
-+					requestBody["response_format"] = map[string]interface{}{
-+						"type": "json_object",
-+					}
-+				}
-+			case map[string]interface{}:
-+				// JSON Schema object for structured outputs
-+				requestBody["response_format"] = map[string]interface{}{
-+					"type":   "json_schema",
-+					"schema": f,
-+				}
-+			}
-+		}
-+	}
-+
-+	return json.Marshal(requestBody)
-+}
-+
-+func openAIToolCallsToOllama(toolCalls []OpenAIToolCall) []OllamaToolCall {
++func openAIToolCallsToOllama(toolCalls []openAIToolCall) []ollamaToolCall {
 +	if len(toolCalls) == 0 {
 +		return nil
 +	}
-+
-+	ollamaToolCalls := make([]OllamaToolCall, len(toolCalls))
++	out := make([]ollamaToolCall, 0, len(toolCalls))
 +	for i, tc := range toolCalls {
-+		var args map[string]interface{}
-+		json.Unmarshal([]byte(tc.Function.Arguments), &args)
-+
-+		ollamaToolCalls[i] = OllamaToolCall{
-+			ID:   tc.ID, // CRITICAL: Preserve OpenAI ID
++		args := map[string]any{}
++		_ = json.Unmarshal([]byte(tc.Function.Arguments), &args)
++		out = append(out, ollamaToolCall{
++			ID:   tc.ID,
 +			Type: tc.Type,
-+			Function: OllamaToolCallFunc{
++			Function: ollamaToolCallFunc{
 +				Index:     i,
 +				Name:      tc.Function.Name,
 +				Arguments: args,
 +			},
-+		}
++		})
 +	}
-+
-+	return ollamaToolCalls
++	return out
 +}
 +
-+func validateToolRequest(req *OllamaChatRequest) error {
-+	// Validate tool definitions
++func validateOllamaToolRequest(req *ollamaChatRequest) error {
 +	for i, tool := range req.Tools {
-+		if tool.Type != "function" {
++		if defaultString(tool.Type, "function") != "function" {
 +			return fmt.Errorf("tool %d: only 'function' type is supported", i)
 +		}
 +		if tool.Function.Name == "" {
@@ -1596,281 +1162,46 @@ index 0000000..210177b
 +		}
 +	}
 +
-+	// Validate messages - be lenient for compatibility with various clients
-+	// and to handle models that hallucinate invalid tool calls
-+	//
-+	// First pass: filter out invalid tool calls with empty function names
++	validMessages := make([]ollamaMessage, 0, len(req.Messages))
 +	for i, msg := range req.Messages {
 +		if msg.Role == "assistant" && len(msg.ToolCalls) > 0 {
-+			validToolCalls := make([]OllamaToolCall, 0, len(msg.ToolCalls))
++			validCalls := make([]ollamaToolCall, 0, len(msg.ToolCalls))
 +			for _, tc := range msg.ToolCalls {
 +				if tc.Function.Name != "" {
-+					validToolCalls = append(validToolCalls, tc)
++					validCalls = append(validCalls, tc)
 +				}
-+				// Silently skip invalid tool calls with empty function names
 +			}
-+			// Update the message with only valid tool calls
-+			req.Messages[i].ToolCalls = validToolCalls
++			req.Messages[i].ToolCalls = validCalls
++			msg.ToolCalls = validCalls
 +		}
-+	}
-+
-+	// Second pass: filter out tool response messages that have empty tool_name
-+	// These correspond to the hallucinated tool calls we filtered above
-+	validMessages := make([]OllamaMessage, 0, len(req.Messages))
-+	for _, msg := range req.Messages {
-+		// Skip tool responses with empty identifiers (responses to hallucinated tool calls)
 +		if msg.Role == "tool" && msg.ToolCallID == "" && msg.ToolName == "" {
-+			continue // Skip this message entirely
++			continue
 +		}
 +		validMessages = append(validMessages, msg)
 +	}
 +	req.Messages = validMessages
-+
 +	return nil
 +}
-+
-+func createOpenAILegacyCompletionRequestBody(modelName string, prompt string, stream bool, options map[string]interface{}) ([]byte, error) {
-+	requestBody := map[string]interface{}{
-+		"model":  modelName,
-+		"prompt": prompt,
-+		"stream": stream,
-+	}
-+	if options != nil {
-+		for k, v := range options {
-+			if _, exists := requestBody[k]; !exists {
-+				requestBody[k] = v
-+			}
-+		}
-+	}
-+	return json.Marshal(requestBody)
-+}
-diff --git a/proxy/proxymanager.go b/proxy/proxymanager.go
-index 0b5b857..a2ef8ae 100644
---- a/proxy/proxymanager.go
-+++ b/proxy/proxymanager.go
-@@ -65,7 +65,7 @@ func (ic *InflightCounter) Decrement() int {
- }
- 
- type ProxyManager struct {
--	sync.Mutex
-+	sync.RWMutex
- 
- 	config    config.Config
- 	ginEngine *gin.Engine
-@@ -220,6 +220,7 @@ func New(proxyConfig config.Config) *ProxyManager {
- 	}
- 
- 	pm.setupGinEngine()
-+	pm.RegisterOllamaRoutes()
- 
- 	// run any startup hooks
- 	if len(proxyConfig.Hooks.OnStartup.Preload) > 0 {
-@@ -510,6 +511,39 @@ func (pm *ProxyManager) trackInflight() gin.HandlerFunc {
- 	}
- }
- 
-+// RegisterOllamaRoutes sets up the Ollama-compatible API endpoints.
-+func (pm *ProxyManager) RegisterOllamaRoutes() {
-+	// General Ollama API
-+	pm.ginEngine.HEAD("/", pm.ollamaHeartbeatHandler) //HEAD '/' does not conflict with llama-swap's GET '/'
-+
-+	// Ollama version endpoint conflicted with llama-swap's
-+	//pm.ginEngine.GET("/api/version", pm.ollamaVersionHandler())
-+	pm.ginEngine.HEAD("/api/version", pm.ollamaVersionHandler())
-+
-+	// Model management
-+	pm.ginEngine.GET("/api/tags", pm.ollamaListTagsHandler())
-+	pm.ginEngine.POST("/api/show", pm.ollamaShowHandler())
-+	pm.ginEngine.GET("/api/ps", pm.ollamaPSHandler())
-+
-+	// Inference
-+	pm.ginEngine.POST("/api/generate", pm.ollamaGenerateHandler())
-+	pm.ginEngine.POST("/api/chat", pm.ollamaChatHandler())
-+
-+	// Embeddings
-+	pm.ginEngine.POST("/api/embed", pm.ollamaEmbedHandler())
-+	pm.ginEngine.POST("/api/embeddings", pm.ollamaLegacyEmbeddingsHandler()) // legacy endpoint
-+
-+	// Stubbed endpoints
-+	stubbedPostRoutes := []string{
-+		"/api/pull", "/api/push", "/api/copy",
-+		"/api/create", "/api/delete",
-+	}
-+	for _, route := range stubbedPostRoutes {
-+		pm.ginEngine.POST(route, pm.ollamaNotImplementedHandler)
-+	}
-+	pm.ginEngine.POST("/api/blobs/:digest", pm.ollamaNotImplementedHandler)
-+}
-+
- // ServeHTTP implements http.Handler interface
- func (pm *ProxyManager) ServeHTTP(w http.ResponseWriter, r *http.Request) {
- 	pm.ginEngine.ServeHTTP(w, r)
-@@ -760,6 +794,14 @@ func (pm *ProxyManager) mkProxyJSONHandler(cf captureFields) func(*gin.Context)
- 			return
- 		}
- 
-+		// Some clients (Copilot) omit parameters in function definitions instead of sending empty ones
-+		// llama-server is strict about the schema. This ensures compliance.
-+		bodyBytes, err = ensureOpenAIToolParameters(bodyBytes, pm.proxyLogger)
-+		if err != nil {
-+			pm.sendErrorResponse(c, http.StatusInternalServerError, fmt.Sprintf("error processing tools in request: %s", err.Error()))
-+			return
-+		}
-+
- 		requestedModel := gjson.GetBytes(bodyBytes, "model").String()
- 		if requestedModel == "" {
- 			pm.sendErrorResponse(c, http.StatusBadRequest, "missing or invalid 'model' key")
-@@ -869,6 +911,56 @@ func (pm *ProxyManager) mkProxyJSONHandler(cf captureFields) func(*gin.Context)
- 			return
- 		}
- 
-+		// Apply config-level chatTemplateKwargs as defaults
-+		// Request-level values take precedence over config defaults
-+		modelConfig := pm.config.Models[modelID]
-+		if len(modelConfig.ChatTemplateKwargs) > 0 {
-+			existingKwargs := gjson.GetBytes(bodyBytes, "chat_template_kwargs")
-+			if !existingKwargs.Exists() {
-+				bodyBytes, err = sjson.SetBytes(bodyBytes, "chat_template_kwargs", modelConfig.ChatTemplateKwargs)
-+				if err != nil {
-+					pm.sendErrorResponse(c, http.StatusInternalServerError, fmt.Sprintf("error setting chat_template_kwargs from config: %s", err.Error()))
-+					return
-+				}
-+				pm.proxyLogger.Debugf("<%s> applied config-level chatTemplateKwargs: %v", modelID, modelConfig.ChatTemplateKwargs)
-+			} else {
-+				for key, value := range modelConfig.ChatTemplateKwargs {
-+					path := "chat_template_kwargs." + key
-+					if !gjson.GetBytes(bodyBytes, path).Exists() {
-+						bodyBytes, err = sjson.SetBytes(bodyBytes, path, value)
-+						if err != nil {
-+							pm.sendErrorResponse(c, http.StatusInternalServerError, fmt.Sprintf("error merging chat_template_kwargs.%s: %s", key, err.Error()))
-+							return
-+						}
-+						pm.proxyLogger.Debugf("<%s> applied config default chatTemplateKwargs.%s=%v", modelID, key, value)
-+					}
-+				}
-+			}
-+		}
-+
-+		// Translate Ollama's "think" parameter to llama-server's "chat_template_kwargs"
-+		// This allows OpenAI API clients to control thinking mode using the Ollama convention
-+		if thinkResult := gjson.GetBytes(bodyBytes, "think"); thinkResult.Exists() {
-+			thinkValue := thinkResult.Bool()
-+			if !gjson.GetBytes(bodyBytes, "chat_template_kwargs").Exists() {
-+				bodyBytes, err = sjson.SetBytes(bodyBytes, "chat_template_kwargs", map[string]interface{}{
-+					"enable_thinking": thinkValue,
-+				})
-+				if err != nil {
-+					pm.sendErrorResponse(c, http.StatusInternalServerError, fmt.Sprintf("error setting chat_template_kwargs: %s", err.Error()))
-+					return
-+				}
-+			} else {
-+				bodyBytes, err = sjson.SetBytes(bodyBytes, "chat_template_kwargs.enable_thinking", thinkValue)
-+				if err != nil {
-+					pm.sendErrorResponse(c, http.StatusInternalServerError, fmt.Sprintf("error setting enable_thinking: %s", err.Error()))
-+					return
-+				}
-+			}
-+			bodyBytes, _ = sjson.DeleteBytes(bodyBytes, "think")
-+			pm.proxyLogger.Debugf("<%s> translated think=%v to chat_template_kwargs.enable_thinking", modelID, thinkValue)
-+		}
-+
- 		c.Request.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
- 
- 		// dechunk it as we already have all the body bytes see issue #11
-@@ -1047,6 +1139,56 @@ func (pm *ProxyManager) mkPostFormHandler(cf captureFields) func(*gin.Context) {
- 	}
- }
- 
-+// ensureOpenAIToolParameters checks the request body for OpenAI tools
-+// and adds a default empty parameters object if a function tool is missing it.
-+func ensureOpenAIToolParameters(bodyBytes []byte, proxyLogger *logmon.Monitor) ([]byte, error) {
-+	toolsResult := gjson.GetBytes(bodyBytes, "tools")
-+
-+	if !toolsResult.Exists() || !toolsResult.IsArray() {
-+		return bodyBytes, nil
-+	}
-+
-+	currentBodyBytes := bodyBytes
-+	madeChanges := false
-+
-+	for i, tool := range toolsResult.Array() {
-+		if tool.Get("type").String() == "function" {
-+			functionPath := fmt.Sprintf("tools.%d.function", i)
-+			functionResult := gjson.GetBytes(currentBodyBytes, functionPath)
-+
-+			if functionResult.Exists() && functionResult.IsObject() {
-+				parametersPath := functionPath + ".parameters"
-+				if !gjson.GetBytes(currentBodyBytes, parametersPath).Exists() {
-+					defaultParameters := map[string]interface{}{
-+						"type":       "object",
-+						"properties": map[string]interface{}{},
-+					}
-+
-+					newBodyBytes, err := sjson.SetBytes(currentBodyBytes, parametersPath, defaultParameters)
-+					if err != nil {
-+						return nil, fmt.Errorf("failed to set default parameters for tool %d using sjson: %w", i, err)
-+					}
-+					currentBodyBytes = newBodyBytes
-+					madeChanges = true
-+
-+					if proxyLogger != nil {
-+						funcName := functionResult.Get("name").String()
-+						if funcName == "" {
-+							funcName = fmt.Sprintf("tool at index %d", i)
-+						}
-+						proxyLogger.Debugf("OpenAI Proxy: Added default parameters to tool function '%s' in request body using sjson", funcName)
-+					}
-+				}
-+			}
-+		}
-+	}
-+
-+	if madeChanges {
-+		return currentBodyBytes, nil
-+	}
-+	return bodyBytes, nil
-+}
-+
- func (pm *ProxyManager) proxyGETModelHandler(c *gin.Context) {
- 	requestedModel := c.Query("model")
- 	if requestedModel == "" {
-@@ -1091,7 +1233,7 @@ func (pm *ProxyManager) proxyGETModelHandler(c *gin.Context) {
- func (pm *ProxyManager) sendErrorResponse(c *gin.Context, statusCode int, message string) {
- 	acceptHeader := c.GetHeader("Accept")
- 
--	if strings.Contains(acceptHeader, "application/json") {
-+	if strings.Contains(acceptHeader, "application/json") || strings.Contains(acceptHeader, "application/x-ndjson") {
- 		c.JSON(statusCode, gin.H{"error": message})
- 	} else {
- 		c.String(statusCode, message)
-@@ -1222,7 +1364,7 @@ func (pm *ProxyManager) SetVersion(buildDate string, commit string, version stri
- 	defer pm.Unlock()
- 	pm.buildDate = buildDate
- 	pm.commit = commit
--	pm.version = version
-+	pm.version = "0.13.5" //HACK to mimic ollama's API, since upstream API conflicts
- }
- 
- func (pm *ProxyManager) SetPerfMonitor(m *perf.Monitor) {
-diff --git a/proxy/server_arg_parser.go b/proxy/server_arg_parser.go
+diff --git a/internal/server/ollama_metadata.go b/internal/server/ollama_metadata.go
 new file mode 100644
-index 0000000..1c6955b
+index 0000000..0a6bce4
 --- /dev/null
-+++ b/proxy/server_arg_parser.go
-@@ -0,0 +1,218 @@
-+package proxy
++++ b/internal/server/ollama_metadata.go
+@@ -0,0 +1,233 @@
++package server
 +
 +import (
++	"crypto/sha256"
++	"fmt"
 +	"path/filepath"
 +	"regexp"
 +	"strconv"
 +	"strings"
 +
-+	"github.com/mostlygeek/llama-swap/proxy/config"
++	"github.com/mostlygeek/llama-swap/internal/config"
 +)
 +
-+// ServerArgs holds information parsed or inferred from server command line arguments.
-+type ServerArgs struct {
++type OllamaServerArgs struct {
 +	Architecture      string
 +	ContextLength     int
 +	Capabilities      []string
@@ -1878,133 +1209,32 @@ index 0000000..1c6955b
 +	ParameterSize     string
 +	QuantizationLevel string
 +	CmdAlias          string
-+	CmdModelPath      string // Base name of the model file from --model arg
++	CmdModelPath      string
 +}
 +
-+// ServerArgParser defines an interface for parsing server command line arguments.
-+type ServerArgParser interface {
-+	Parse(cmdStr string, modelID string) ServerArgs
-+}
-+
-+// LlamaServerParser implements ServerArgParser for llama-server.
 +type LlamaServerParser struct{}
 +
 +var (
-+	architecturePatterns = map[string]*regexp.Regexp{
-+		"command-r": regexp.MustCompile(`(?i)command-r`),
-+		"gemma2":    regexp.MustCompile(`(?i)gemma2`),
-+		"gemma3":    regexp.MustCompile(`(?i)gemma3`),
-+		"gemma":     regexp.MustCompile(`(?i)gemma`),
-+		"llama4":    regexp.MustCompile(`(?i)llama-?4`),
-+		"llama3":    regexp.MustCompile(`(?i)llama-?3`),
-+		"llama":     regexp.MustCompile(`(?i)llama`),
-+		"mistral3":  regexp.MustCompile(`(?i)mistral-?3`),
-+		"mistral":   regexp.MustCompile(`(?i)mistral`),
-+		"phi3":      regexp.MustCompile(`(?i)phi-?3`),
-+		"phi":       regexp.MustCompile(`(?i)phi`),
-+		"qwen2.5vl": regexp.MustCompile(`(?i)qwen-?2\.5-?vl`),
-+		"qwen3":     regexp.MustCompile(`(?i)qwen-?3`),
-+		"qwen2":     regexp.MustCompile(`(?i)qwen-?2`),
-+		"qwen":      regexp.MustCompile(`(?i)qwen`),
-+		"bert":      regexp.MustCompile(`(?i)bert`),
-+		"clip":      regexp.MustCompile(`(?i)clip`),
++	ollamaArchitecturePatterns = map[string]*regexp.Regexp{
++		"command-r": regexp.MustCompile(`(?i)command-r`), "gemma3": regexp.MustCompile(`(?i)gemma3`), "gemma2": regexp.MustCompile(`(?i)gemma2`), "gemma": regexp.MustCompile(`(?i)gemma`), "llama4": regexp.MustCompile(`(?i)llama-?4`), "llama3": regexp.MustCompile(`(?i)llama-?3`), "llama": regexp.MustCompile(`(?i)llama`), "mistral": regexp.MustCompile(`(?i)mistral`), "phi": regexp.MustCompile(`(?i)phi`), "qwen3": regexp.MustCompile(`(?i)qwen-?3`), "qwen2": regexp.MustCompile(`(?i)qwen-?2`), "qwen": regexp.MustCompile(`(?i)qwen`), "bert": regexp.MustCompile(`(?i)bert`), "clip": regexp.MustCompile(`(?i)clip`),
 +	}
-+	orderedArchKeys = []string{
-+		"command-r", "gemma3", "gemma2", "gemma", "llama4", "llama3", "llama",
-+		"mistral3", "mistral", "phi3", "phi", "qwen2.5vl", "qwen3", "qwen2", "qwen",
-+		"bert", "clip",
-+	}
-+
-+	parameterSizePattern = regexp.MustCompile(`(?i)(\d+(?:\.\d+)?(?:x\d+)?)[BMGT]?B`)
-+	quantizationPatterns = []*regexp.Regexp{
-+		regexp.MustCompile(`(?i)IQ[1-4]_(XXS|XS|S|M|NL)`),
-+		regexp.MustCompile(`(?i)Q[2-8]_(0|1|[KSLM]+(?:_[KSLM]+)?)`),
-+		regexp.MustCompile(`(?i)BPW\d+`),
-+		regexp.MustCompile(`(?i)GGML_TYPE_Q[2-8]_\d`),
-+		regexp.MustCompile(`(?i)F(?:P)?(16|32)`),
-+		regexp.MustCompile(`(?i)BF16`),
-+	}
++	ollamaOrderedArchKeys      = []string{"command-r", "gemma3", "gemma2", "gemma", "llama4", "llama3", "llama", "mistral", "phi", "qwen3", "qwen2", "qwen", "bert", "clip"}
++	ollamaParameterSizePattern = regexp.MustCompile(`(?i)(\d+(?:\.\d+)?(?:x\d+)?)[BMGT]?B`)
++	ollamaQuantizationPatterns = []*regexp.Regexp{regexp.MustCompile(`(?i)IQ[1-4]_(XXS|XS|S|M|NL)`), regexp.MustCompile(`(?i)Q[2-8]_(0|1|[KSLM]+(?:_[KSLM]+)?)`), regexp.MustCompile(`(?i)F(?:P)?(16|32)`), regexp.MustCompile(`(?i)BF16`)}
 +)
 +
-+func inferPattern(name string, patterns map[string]*regexp.Regexp, orderedKeys []string) string {
-+	nameLower := strings.ToLower(name)
-+	for _, key := range orderedKeys {
-+		pattern, ok := patterns[key]
-+		if !ok || pattern == nil {
-+			continue
-+		}
-+		if pattern.MatchString(nameLower) {
-+			return key
-+		}
-+	}
-+	return "unknown"
-+}
-+
-+func inferQuantizationLevelFromName(name string) string {
-+	for _, pattern := range quantizationPatterns {
-+		match := pattern.FindString(name)
-+		if match != "" {
-+			return strings.ToUpper(match)
-+		}
-+	}
-+	return "unknown"
-+}
-+
-+func inferParameterSizeFromName(name string) string {
-+	match := parameterSizePattern.FindStringSubmatch(name)
-+	if len(match) > 0 {
-+		return strings.ToUpper(match[0])
-+	}
-+	return "unknown"
-+}
-+
-+func inferFamilyFromName(nameForInference string, currentArch string) string {
-+	if currentArch != "unknown" && currentArch != "" {
-+		re := regexp.MustCompile(`^([a-zA-Z_][a-zA-Z0-9_]*)`)
-+		match := re.FindStringSubmatch(currentArch)
-+		if len(match) > 1 {
-+			potentialFamily := strings.ToLower(match[1])
-+			knownFamilies := []string{"llama", "qwen", "phi", "mistral", "gemma", "command-r", "bert", "clip"}
-+			for _, kf := range knownFamilies {
-+				if potentialFamily == kf {
-+					return kf
-+				}
-+			}
-+			for _, kf := range knownFamilies {
-+				if strings.ToLower(currentArch) == kf {
-+					return kf
-+				}
-+			}
-+		}
-+	}
-+	orderedFamilyCheckKeys := []string{"command-r", "gemma", "llama", "mistral", "phi", "qwen", "bert", "clip"}
-+	familyPatterns := make(map[string]*regexp.Regexp)
-+	for _, key := range orderedFamilyCheckKeys {
-+		if p, ok := architecturePatterns[key]; ok {
-+			familyPatterns[key] = p
-+		}
-+	}
-+	return inferPattern(nameForInference, familyPatterns, orderedFamilyCheckKeys)
-+}
-+
-+// NewLlamaServerParser creates a new parser for llama-server arguments.
 +func NewLlamaServerParser() *LlamaServerParser {
 +	return &LlamaServerParser{}
 +}
 +
-+// Parse extracts relevant information from llama-server command string and modelID.
-+func (p *LlamaServerParser) Parse(cmdStr string, modelID string) ServerArgs {
-+	parsed := ServerArgs{
-+		Capabilities: []string{"completion"}, // Default
-+	}
-+
++func (p *LlamaServerParser) Parse(cmdStr string, modelID string) OllamaServerArgs {
++	parsed := OllamaServerArgs{Capabilities: []string{"completion"}}
 +	args, err := config.SanitizeCommand(cmdStr)
 +	if err != nil {
-+		// If sanitization fails, proceed with inference based on modelID only
-+		parsed.Architecture = inferPattern(modelID, architecturePatterns, orderedArchKeys)
-+		parsed.Family = inferFamilyFromName(modelID, parsed.Architecture)
-+		parsed.ParameterSize = inferParameterSizeFromName(modelID)
-+		parsed.QuantizationLevel = inferQuantizationLevelFromName(modelID)
++		parsed.Architecture = inferOllamaPattern(modelID, ollamaArchitecturePatterns, ollamaOrderedArchKeys)
++		parsed.Family = inferOllamaFamily(modelID, parsed.Architecture)
++		parsed.ParameterSize = inferOllamaParameterSize(modelID)
++		parsed.QuantizationLevel = inferOllamaQuantization(modelID)
 +		return parsed
 +	}
 +
@@ -2013,8 +1243,8 @@ index 0000000..1c6955b
 +		switch arg {
 +		case "-c", "--ctx-size":
 +			if i+1 < len(args) {
-+				if valInt, err := strconv.Atoi(args[i+1]); err == nil {
-+					parsed.ContextLength = valInt
++				if val, err := strconv.Atoi(args[i+1]); err == nil {
++					parsed.ContextLength = val
 +				}
 +				i++
 +			}
@@ -2029,50 +1259,185 @@ index 0000000..1c6955b
 +				i++
 +			}
 +		case "--jinja":
-+			foundTools := false
-+			for _, cap := range parsed.Capabilities {
-+				if cap == "tools" {
-+					foundTools = true
-+					break
-+				}
-+			}
-+			if !foundTools {
++			if !containsString(parsed.Capabilities, "tools") {
 +				parsed.Capabilities = append(parsed.Capabilities, "tools")
 +			}
 +		}
 +	}
 +
-+	parsed.Architecture = inferPattern(modelID, architecturePatterns, orderedArchKeys)
-+	if parsed.Architecture == "unknown" {
-+		parsed.Architecture = inferPattern(parsed.CmdAlias, architecturePatterns, orderedArchKeys)
-+	}
-+	if parsed.Architecture == "unknown" {
-+		parsed.Architecture = inferPattern(parsed.CmdModelPath, architecturePatterns, orderedArchKeys)
-+	}
-+
-+	parsed.Family = inferFamilyFromName(modelID, parsed.Architecture)
-+	if parsed.Family == "unknown" {
-+		parsed.Family = inferFamilyFromName(parsed.CmdAlias, parsed.Architecture)
-+	}
-+	if parsed.Family == "unknown" {
-+		parsed.Family = inferFamilyFromName(parsed.CmdModelPath, parsed.Architecture)
-+	}
-+
-+	parsed.ParameterSize = inferParameterSizeFromName(modelID)
-+	if parsed.ParameterSize == "unknown" {
-+		parsed.ParameterSize = inferParameterSizeFromName(parsed.CmdAlias)
-+	}
-+	if parsed.ParameterSize == "unknown" {
-+		parsed.ParameterSize = inferParameterSizeFromName(parsed.CmdModelPath)
-+	}
-+
-+	parsed.QuantizationLevel = inferQuantizationLevelFromName(modelID)
-+	if parsed.QuantizationLevel == "unknown" {
-+		parsed.QuantizationLevel = inferQuantizationLevelFromName(parsed.CmdAlias)
-+	}
-+	if parsed.QuantizationLevel == "unknown" {
-+		parsed.QuantizationLevel = inferQuantizationLevelFromName(parsed.CmdModelPath)
-+	}
-+
++	parsed.Architecture = firstKnown(
++		inferOllamaPattern(modelID, ollamaArchitecturePatterns, ollamaOrderedArchKeys),
++		inferOllamaPattern(parsed.CmdAlias, ollamaArchitecturePatterns, ollamaOrderedArchKeys),
++		inferOllamaPattern(parsed.CmdModelPath, ollamaArchitecturePatterns, ollamaOrderedArchKeys),
++	)
++	parsed.Family = firstKnown(
++		inferOllamaFamily(modelID, parsed.Architecture),
++		inferOllamaFamily(parsed.CmdAlias, parsed.Architecture),
++		inferOllamaFamily(parsed.CmdModelPath, parsed.Architecture),
++	)
++	parsed.ParameterSize = firstKnown(
++		inferOllamaParameterSize(modelID),
++		inferOllamaParameterSize(parsed.CmdAlias),
++		inferOllamaParameterSize(parsed.CmdModelPath),
++	)
++	parsed.QuantizationLevel = firstKnown(
++		inferOllamaQuantization(modelID),
++		inferOllamaQuantization(parsed.CmdAlias),
++		inferOllamaQuantization(parsed.CmdModelPath),
++	)
 +	return parsed
 +}
++
++func ollamaDetailsForModel(model string, modelCfg config.ModelConfig) ollamaModelDetails {
++	metadata := modelCfg.Metadata
++	parsed := NewLlamaServerParser().Parse(modelCfg.Cmd, model)
++	details := ollamaModelDetails{Format: "gguf"}
++	if family, ok := metadata["family"].(string); ok && family != "" {
++		details.Family = family
++	} else if parsed.Family != "" {
++		details.Family = parsed.Family
++	} else if arch, ok := metadata["architecture"].(string); ok && arch != "" {
++		details.Family = inferOllamaFamily(model, arch)
++	} else {
++		details.Family = inferOllamaFamily(model, inferOllamaPattern(model, ollamaArchitecturePatterns, ollamaOrderedArchKeys))
++	}
++	if details.Family != "" && details.Family != "unknown" {
++		details.Families = []string{details.Family}
++	}
++	if paramSize, ok := metadata["parameterSize"].(string); ok && paramSize != "" {
++		details.ParameterSize = paramSize
++	} else if parsed.ParameterSize != "" {
++		details.ParameterSize = parsed.ParameterSize
++	} else {
++		details.ParameterSize = inferOllamaParameterSize(model)
++	}
++	if quant, ok := metadata["quantizationLevel"].(string); ok && quant != "" {
++		details.QuantizationLevel = quant
++	} else if parsed.QuantizationLevel != "" {
++		details.QuantizationLevel = parsed.QuantizationLevel
++	} else {
++		details.QuantizationLevel = inferOllamaQuantization(model)
++	}
++	details.ContextLength = metadataInt(metadata, "contextLength", parsed.ContextLength)
++	return details
++}
++
++func ollamaCapabilitiesForModel(modelCfg config.ModelConfig) []string {
++	if values, ok := modelCfg.Metadata["capabilities"].([]any); ok && len(values) > 0 {
++		caps := make([]string, 0, len(values))
++		for _, item := range values {
++			if s, ok := item.(string); ok && s != "" {
++				caps = append(caps, s)
++			}
++		}
++		if len(caps) > 0 {
++			return caps
++		}
++	}
++
++	caps := []string{"completion"}
++	if modelCfg.Capabilities.Tools {
++		caps = append(caps, "tools")
++	}
++	return caps
++}
++
++func metadataString(metadata map[string]any, key string, fallback string) string {
++	if v, ok := metadata[key].(string); ok && v != "" {
++		return v
++	}
++	if fallback != "" {
++		return fallback
++	}
++	return "unknown"
++}
++
++func metadataInt(metadata map[string]any, key string, fallback int) int {
++	switch v := metadata[key].(type) {
++	case int:
++		if v != 0 {
++			return v
++		}
++	case int64:
++		if v != 0 {
++			return int(v)
++		}
++	case float64:
++		if v != 0 {
++			return int(v)
++		}
++	}
++	return fallback
++}
++
++func firstKnown(values ...string) string {
++	for _, value := range values {
++		if value != "" && value != "unknown" {
++			return value
++		}
++	}
++	return "unknown"
++}
++
++func containsString(values []string, needle string) bool {
++	for _, value := range values {
++		if value == needle {
++			return true
++		}
++	}
++	return false
++}
++
++func inferOllamaPattern(name string, patterns map[string]*regexp.Regexp, orderedKeys []string) string {
++	lower := strings.ToLower(name)
++	for _, key := range orderedKeys {
++		if pattern := patterns[key]; pattern != nil && pattern.MatchString(lower) {
++			return key
++		}
++	}
++	return "unknown"
++}
++func inferOllamaFamily(model string, arch string) string {
++	if arch != "" && arch != "unknown" {
++		return arch
++	}
++	return inferOllamaPattern(model, ollamaArchitecturePatterns, ollamaOrderedArchKeys)
++}
++func inferOllamaParameterSize(name string) string {
++	if match := ollamaParameterSizePattern.FindStringSubmatch(name); len(match) > 1 {
++		return strings.ToUpper(match[1] + "B")
++	}
++	return "unknown"
++}
++func inferOllamaQuantization(name string) string {
++	for _, pattern := range ollamaQuantizationPatterns {
++		if match := pattern.FindString(name); match != "" {
++			return strings.ToUpper(match)
++		}
++	}
++	return "unknown"
++}
++func digestForModel(model string) string {
++	sum := sha256.Sum256([]byte(model))
++	return fmt.Sprintf("%x", sum[:])
++}
+diff --git a/internal/server/server.go b/internal/server/server.go
+index 0d27d89..ec3b248 100644
+--- a/internal/server/server.go
++++ b/internal/server/server.go
+@@ -209,0 +210,15 @@ func (s *Server) routes() {
++	mux.HandleFunc("HEAD /{$}", handleOllamaHeartbeat)
++	mux.HandleFunc("HEAD /api/version", s.handleOllamaVersion)
++	mux.HandleFunc("GET /api/tags", s.handleOllamaTags)
++	mux.HandleFunc("POST /api/show", s.handleOllamaShow)
++	mux.HandleFunc("GET /api/ps", s.handleOllamaPS)
++	mux.HandleFunc("POST /api/generate", s.handleOllamaGenerate)
++	mux.HandleFunc("POST /api/chat", s.handleOllamaChat)
++	mux.HandleFunc("POST /api/embed", s.handleOllamaEmbed)
++	mux.HandleFunc("POST /api/embeddings", s.handleOllamaEmbeddings)
++	mux.HandleFunc("POST /api/pull", handleOllamaNotImplemented)
++	mux.HandleFunc("POST /api/push", handleOllamaNotImplemented)
++	mux.HandleFunc("POST /api/copy", handleOllamaNotImplemented)
++	mux.HandleFunc("POST /api/create", handleOllamaNotImplemented)
++	mux.HandleFunc("POST /api/delete", handleOllamaNotImplemented)
++	mux.HandleFunc("POST /api/blobs/{digest}", handleOllamaNotImplemented)
